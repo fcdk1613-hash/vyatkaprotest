@@ -54,11 +54,6 @@ def client_menu():
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
     ])
 
-def back_button():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
-    ])
-
 # ================== ОБРАБОТЧИКИ ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Привет! Я бот для управления задачами.", reply_markup=main_menu())
@@ -159,8 +154,12 @@ async def open_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"🏢 <b>Клиент:</b> {client}\n"
         if addr:
             msg += f"📍 <b>Адрес:</b> {addr}\n🔗 <a href='https://yandex.ru/maps/?text={addr}'>Открыть в Яндекс.Картах</a>\n"
-        if sol:
-            msg += f"📝 <b>Решение:</b> {sol}\n"
+
+        if status == "done":
+            if sol:
+                msg += f"📝 <b>Решение:</b> {sol}\n"
+            if avr:
+                await query.message.reply_document(document=InputFile(avr), caption="📎 АВР")
 
         keyboard = []
         if status != "done":
@@ -169,8 +168,6 @@ async def open_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard),
                                        parse_mode="HTML", disable_web_page_preview=True)
-        if avr:
-            await query.message.reply_document(document=InputFile(avr), caption="📎 АВР")
 
 async def complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -203,15 +200,15 @@ async def history_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== MAIN ==================
 def main():
-    TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"  # 🔑 токен от BotFather
+    TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА"  # 🔑 токен от BotFather
 
     app = Application.builder().token(TOKEN).build()
     app.bot.delete_webhook(drop_pending_updates=True)
 
     conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(menu_handler)],
+        entry_points=[CallbackQueryHandler(menu_handler, pattern="^(new|current|history|back_main)$")],
         states={
-            CHOOSING_TYPE: [CallbackQueryHandler(choose_type)],
+            CHOOSING_TYPE: [CallbackQueryHandler(choose_type, pattern="^(general|field)$")],
             CHOOSING_CLIENT: [CallbackQueryHandler(choose_client)],
             ENTER_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_text)],
             ENTER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_address)],
@@ -225,6 +222,8 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv)
+
+    # Эти работают ВНЕ ConversationHandler
     app.add_handler(CallbackQueryHandler(open_task, pattern=r"^open_\d+$"))
     app.add_handler(CallbackQueryHandler(complete_task, pattern=r"^complete_\d+$"))
 
