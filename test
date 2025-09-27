@@ -26,19 +26,21 @@ conn.commit()
 
 # ================== СОСТОЯНИЯ ==================
 CHOOSING_TYPE, CHOOSING_CLIENT, ENTER_TEXT, ENTER_ADDRESS, \
-CHOOSING_DATE, CHOOSING_TIME, WAITING_AVR, WAITING_SOLUTION, HISTORY_FILTER = range(9)
+CHOOSING_DATE, WAITING_AVR, WAITING_SOLUTION, HISTORY_FILTER = range(8)
 
 # ================== КНОПКИ ==================
 def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Новая задача", callback_data="new")],
+        [InlineKeyboardButton("📌 Текущие задачи", callback_data="current")],
         [InlineKeyboardButton("📜 История задач", callback_data="history")]
     ])
 
 def type_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📝 Общая", callback_data="general")],
-        [InlineKeyboardButton("🚗 Выездная", callback_data="field")]
+        [InlineKeyboardButton("🚗 Выездная", callback_data="field")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
     ])
 
 def client_menu():
@@ -48,7 +50,13 @@ def client_menu():
         [InlineKeyboardButton("👗 Глория Джинс", callback_data="Глория Джинс")],
         [InlineKeyboardButton("🛒 Перекресток", callback_data="Перекресток")],
         [InlineKeyboardButton("⛽ Тебойл", callback_data="Тебойл")],
-        [InlineKeyboardButton("⛽ Татнефть", callback_data="Татнефть")]
+        [InlineKeyboardButton("⛽ Татнефть", callback_data="Татнефть")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
+    ])
+
+def back_button():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
     ])
 
 # ================== ОБРАБОТЧИКИ ==================
@@ -58,18 +66,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
     if query.data == "new":
         await query.message.edit_text("Выберите тип задачи:", reply_markup=type_menu())
         return CHOOSING_TYPE
+
+    elif query.data == "current":
+        c.execute("SELECT id, text FROM tasks WHERE status='active' ORDER BY id DESC")
+        tasks = c.fetchall()
+        if not tasks:
+            await query.message.reply_text("📭 Нет текущих задач.", reply_markup=main_menu())
+            return ConversationHandler.END
+        kb = [[InlineKeyboardButton(f"🔎 {t[1][:30]}...", callback_data=f"open_{t[0]}")] for t in tasks]
+        kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
+        await query.message.reply_text("📌 Текущие задачи:", reply_markup=InlineKeyboardMarkup(kb))
+        return HISTORY_FILTER
+
     elif query.data == "history":
-        c.execute("SELECT id, text, status FROM tasks ORDER BY id DESC LIMIT 10")
+        c.execute("SELECT id, text FROM tasks WHERE status='done' ORDER BY id DESC LIMIT 10")
         tasks = c.fetchall()
         if not tasks:
             await query.message.reply_text("📭 История пуста.", reply_markup=main_menu())
             return ConversationHandler.END
-        kb = [[InlineKeyboardButton(f"🔎 {t[1][:30]}... ({t[2]})", callback_data=f"open_{t[0]}")] for t in tasks]
-        await query.message.reply_text("📜 История задач:", reply_markup=InlineKeyboardMarkup(kb))
+        kb = [[InlineKeyboardButton(f"📜 {t[1][:30]}...", callback_data=f"open_{t[0]}")] for t in tasks]
+        kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
+        await query.message.reply_text("📜 История завершённых задач:", reply_markup=InlineKeyboardMarkup(kb))
         return HISTORY_FILTER
+
+    elif query.data == "back_main":
+        await query.message.edit_text("🏠 Главное меню:", reply_markup=main_menu())
+        return ConversationHandler.END
 
 async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -111,7 +137,7 @@ async def manual_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
               (update.effective_user.id, ud.get("type"), ud.get("client"),
                ud.get("text"), ud.get("address"), ud.get("deadline"), "active"))
     conn.commit()
-    await update.message.reply_text("✅ Задача создана!", reply_markup=main_menu())
+    await update.message.reply_text("✅ Задача добавлена в текущие!", reply_markup=main_menu())
     return ConversationHandler.END
 
 async def open_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -135,9 +161,12 @@ async def open_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"📍 <b>Адрес:</b> {addr}\n🔗 <a href='https://yandex.ru/maps/?text={addr}'>Открыть в Яндекс.Картах</a>\n"
         if sol:
             msg += f"📝 <b>Решение:</b> {sol}\n"
+
         keyboard = []
         if status != "done":
             keyboard.append([InlineKeyboardButton("✅ Завершить", callback_data=f"complete_{tid}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
+
         await query.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard),
                                        parse_mode="HTML", disable_web_page_preview=True)
         if avr:
@@ -166,7 +195,7 @@ async def receive_solution(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sol = update.message.text
     c.execute("UPDATE tasks SET solution=?, status=? WHERE id=?", (sol, "done", tid))
     conn.commit()
-    await update.message.reply_text("✅ Задача завершена!", reply_markup=main_menu())
+    await update.message.reply_text("✅ Задача завершена и перенесена в историю!", reply_markup=main_menu())
     return ConversationHandler.END
 
 async def history_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -174,7 +203,7 @@ async def history_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== MAIN ==================
 def main():
-    TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"  # 🔑 токен от BotFather
+    TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА"  # 🔑 токен от BotFather
 
     app = Application.builder().token(TOKEN).build()
     app.bot.delete_webhook(drop_pending_updates=True)
