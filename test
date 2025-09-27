@@ -1,0 +1,288 @@
+# Telegram Time Management Bot with Icons
+
+```python
+import logging
+import sqlite3
+from datetime import datetime, timedelta
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup)
+from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler, ConversationHandler,
+                          ContextTypes, filters)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# DB setup
+conn = sqlite3.connect("tasks.db", check_same_thread=False)
+c = conn.cursor()
+c.execute("""
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    task_type TEXT,
+    client TEXT,
+    text TEXT,
+    address TEXT,
+    deadline TEXT,
+    avr_file_id TEXT,
+    solution TEXT,
+    status TEXT
+)
+""")
+conn.commit()
+
+# Conversation states
+(CHOOSING_TYPE, CHOOSING_CLIENT, ENTER_TEXT, ENTER_ADDRESS, CHOOSING_DATE, CHOOSING_TIME, WAITING_AVR, WAITING_SOLUTION, HISTORY_FILTER) = range(9)
+
+CLIENTS = ["Максавит", "Газпромнефть", "Глория Джинс", "Перекресток", "Тебойл", "Татнефть"]
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🆕 Новая задача", callback_data="new_task")],
+        [InlineKeyboardButton("📋 Мои задачи", callback_data="my_tasks")],
+        [InlineKeyboardButton("📖 История", callback_data="history")]
+    ]
+    await update.message.reply_text("Выберите действие:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "new_task":
+        keyboard = [[InlineKeyboardButton("📝 Общая", callback_data="general"),
+                     InlineKeyboardButton("🚗 Выездная", callback_data="field")]]
+        await query.message.reply_text("Выберите тип задачи:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return CHOOSING_TYPE
+    elif query.data == "my_tasks":
+        c.execute("SELECT id, text, status FROM tasks WHERE user_id=? AND status!='done'", (query.from_user.id,))
+        tasks = c.fetchall()
+        if not tasks:
+            await query.message.reply_text("У вас нет активных задач.")
+            return ConversationHandler.END
+        text = "Ваши задачи:\n"
+        keyboard = []
+        for tid, ttext, status in tasks:
+            text += f"#{tid} - {ttext} ({status})\n"
+            keyboard.append([InlineKeyboardButton(f"🔎 Открыть {tid}", callback_data=f"open_{tid}")])
+        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return ConversationHandler.END
+    elif query.data == "history":
+        keyboard = [
+            [InlineKeyboardButton("🗓 За неделю", callback_data="hist_week")],
+            [InlineKeyboardButton("📅 За месяц", callback_data="hist_month")],
+            [InlineKeyboardButton("📂 Все", callback_data="hist_all")]
+        ]
+        await query.message.reply_text("Выберите период:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return HISTORY_FILTER
+
+async def history_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    period = query.data
+    now = datetime.now()
+
+    if period == "hist_week":
+        since = now - timedelta(days=7)
+    elif period == "hist_month":
+        since = now - timedelta(days=30)
+    else:
+        since = None
+
+    if since:
+        c.execute("SELECT id, text, deadline FROM tasks WHERE user_id=? AND status='done' AND deadline>=?", (query.from_user.id, since.strftime("%Y-%m-%d %H:%M")))
+    else:
+        c.execute("SELECT id, text, deadline FROM tasks WHERE user_id=? AND status='done'", (query.from_user.id,))
+
+    tasks = c.fetchall()
+    if not tasks:
+        await query.message.reply_text("В выбранный период завершённых задач нет.")
+        return ConversationHandler.END
+
+    text = "Завершённые задачи:\n"
+    keyboard = []
+    for tid, ttext, deadline in tasks:
+        text += f"#{tid} - {ttext} (до {deadline})\n"
+        keyboard.append([InlineKeyboardButton(f"🔎 Открыть {tid}", callback_data=f"open_{tid}")])
+    await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    return ConversationHandler.END
+
+async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["task_type"] = query.data
+    if query.data == "field":
+        keyboard = [[InlineKeyboardButton(f"🏢 {client}", callback_data=f"client_{client}")] for client in CLIENTS]
+        await query.message.reply_text("Выберите клиента:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return CHOOSING_CLIENT
+    else:
+        await query.message.reply_text("Введите текст заявки:")
+        return ENTER_TEXT
+
+async def choose_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    client = query.data.split("_", 1)[1]
+    context.user_data["client"] = client
+    await query.message.reply_text("Введите текст заявки:")
+    return ENTER_TEXT
+
+async def enter_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["text"] = update.message.text
+    if context.user_data["task_type"] == "field":
+        await update.message.reply_text("Введите адрес:")
+        return ENTER_ADDRESS
+    else:
+        return await ask_date(update, context)
+
+async def enter_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["address"] = update.message.text
+    return await ask_date(update, context)
+
+async def ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.now().date()
+    keyboard = [[InlineKeyboardButton("📅 Сегодня", callback_data=str(today))],
+                [InlineKeyboardButton("📆 Завтра", callback_data=str(today + timedelta(days=1)))],
+                [InlineKeyboardButton("🗓 Через 2 дня", callback_data=str(today + timedelta(days=2)))],
+                [InlineKeyboardButton("✍️ Ввести вручную", callback_data="manual_date")]]
+    await update.message.reply_text("Выберите дату:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return CHOOSING_DATE
+
+async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "manual_date":
+        await query.message.reply_text("Введите дату в формате ГГГГ-ММ-ДД:")
+        context.user_data["manual_date"] = True
+        return CHOOSING_DATE
+    else:
+        context.user_data["date"] = query.data
+        return await ask_time(query.message, context)
+
+async def manual_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        date = datetime.strptime(update.message.text, "%Y-%m-%d").date()
+        context.user_data["date"] = str(date)
+        return await ask_time(update.message, context)
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат. Попробуйте ещё раз (ГГГГ-ММ-ДД):")
+        return CHOOSING_DATE
+
+async def ask_time(message, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[InlineKeyboardButton("⏰ 09:00", callback_data="09:00"),
+                 InlineKeyboardButton("⏰ 12:00", callback_data="12:00")],
+                [InlineKeyboardButton("⏰ 15:00", callback_data="15:00"),
+                 InlineKeyboardButton("⏰ 18:00", callback_data="18:00")],
+                [InlineKeyboardButton("✍️ Ввести вручную", callback_data="manual_time")]]
+    await message.reply_text("Выберите время:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return CHOOSING_TIME
+
+async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "manual_time":
+        await query.message.reply_text("Введите время в формате ЧЧ:ММ:")
+        context.user_data["manual_time"] = True
+        return CHOOSING_TIME
+    else:
+        context.user_data["time"] = query.data
+        return await save_task(query.message, context)
+
+async def manual_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        datetime.strptime(update.message.text, "%H:%M")
+        context.user_data["time"] = update.message.text
+        return await save_task(update.message, context)
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат. Попробуйте ещё раз (ЧЧ:ММ):")
+        return CHOOSING_TIME
+
+async def save_task(message, context: ContextTypes.DEFAULT_TYPE):
+    deadline = f"{context.user_data['date']} {context.user_data['time']}"
+    c.execute("INSERT INTO tasks (user_id, task_type, client, text, address, deadline, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+              (message.chat_id, context.user_data["task_type"], context.user_data.get("client"), context.user_data["text"], context.user_data.get("address"), deadline, "active"))
+    conn.commit()
+    await message.reply_text("✅ Задача создана!")
+    return ConversationHandler.END
+
+# Завершение выездной задачи
+async def complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tid = int(query.data.split("_")[1])
+    c.execute("SELECT task_type FROM tasks WHERE id=?", (tid,))
+    row = c.fetchone()
+    if row and row[0] == "field":
+        context.user_data["complete_id"] = tid
+        await query.message.reply_text("📎 Прикрепите АВР (файл):")
+        return WAITING_AVR
+    else:
+        c.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+        conn.commit()
+        await query.message.reply_text("✅ Задача завершена!")
+        return ConversationHandler.END
+
+async def receive_avr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file = update.message.document
+    context.user_data["avr_file_id"] = file.file_id
+    await update.message.reply_text("✍️ Теперь введите описание решения:")
+    return WAITING_SOLUTION
+
+async def receive_solution(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = context.user_data["complete_id"]
+    c.execute("UPDATE tasks SET avr_file_id=?, solution=?, status='done' WHERE id=?",
+              (context.user_data["avr_file_id"], update.message.text, tid))
+    conn.commit()
+    await update.message.reply_text("✅ Выездная задача завершена!")
+    return ConversationHandler.END
+
+# Просмотр задачи
+async def open_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tid = int(query.data.split("_")[1])
+    c.execute("SELECT * FROM tasks WHERE id=?", (tid,))
+    row = c.fetchone()
+    if row:
+        _, user_id, ttype, client, text, addr, deadline, avr, sol, status = row
+        msg = f"📌 Задача #{tid}\nТип: {ttype}\nТекст: {text}\nСрок: {deadline}\nСтатус: {status}\n"
+        if client:
+            msg += f"Клиент: {client}\n"
+        if addr:
+            msg += f"📍 Адрес: {addr} (https://yandex.ru/maps/?text={addr})\n"
+        if sol:
+            msg += f"📝 Решение: {sol}\n"
+        keyboard = []
+        if status != "done":
+            keyboard.append([InlineKeyboardButton("✅ Завершить", callback_data=f"complete_{tid}")])
+        await query.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+        if avr:
+            await query.message.reply_document(document=avr, caption="📎 АВР")
+
+
+def main():
+    app = Application.builder().token("YOUR_BOT_TOKEN").build()
+
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(menu_handler)],
+        states={
+            CHOOSING_TYPE: [CallbackQueryHandler(choose_type)],
+            CHOOSING_CLIENT: [CallbackQueryHandler(choose_client)],
+            ENTER_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_text)],
+            ENTER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_address)],
+            CHOOSING_DATE: [CallbackQueryHandler(choose_date), MessageHandler(filters.TEXT & ~filters.COMMAND, manual_date)],
+            CHOOSING_TIME: [CallbackQueryHandler(choose_time), MessageHandler(filters.TEXT & ~filters.COMMAND, manual_time)],
+            WAITING_AVR: [MessageHandler(filters.Document.ALL, receive_avr)],
+            WAITING_SOLUTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_solution)],
+            HISTORY_FILTER: [CallbackQueryHandler(history_filter)],
+        },
+        fallbacks=[]
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(open_task, pattern=r"open_\\d+"))
+    app.add_handler(CallbackQueryHandler(complete_task, pattern=r"complete_\\d+"))
+
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
+```
