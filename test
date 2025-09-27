@@ -152,6 +152,7 @@ async def enter_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def manual_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["deadline"] = update.message.text
     ud = context.user_data
+
     c.execute("""INSERT INTO tasks (user_id, type, client, order_number, description, address, deadline, status)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
               (update.effective_user.id, ud.get("type"), ud.get("client"),
@@ -159,7 +160,16 @@ async def manual_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
                ud.get("deadline"), "active"))
     conn.commit()
 
-    await update.message.reply_text("✅ Задача добавлена в текущие!", reply_markup=main_menu())
+    # Очистка временных данных
+    context.user_data.clear()
+
+    # Возвращаем меню через send_message
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="✅ Задача добавлена в текущие!",
+        reply_markup=main_menu()
+    )
+
     return ConversationHandler.END
 
 # ---- Открыть задачу ----
@@ -244,7 +254,7 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== MAIN ==================
 def main():
-    TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"
+    TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА"
 
     app = Application.builder().token(TOKEN).build()
     app.bot.delete_webhook(drop_pending_updates=True)
