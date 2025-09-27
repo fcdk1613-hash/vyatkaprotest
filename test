@@ -372,7 +372,7 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Запуск ----------
 def main():
-    TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА"  # <- Вставь токен
+    TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"  # <- Вставь токен
     app = Application.builder().token(TOKEN).build()
 
     # командный хэндлер
