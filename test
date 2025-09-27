@@ -248,7 +248,7 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== MAIN ==================
 def main():
-    TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА"
+    TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"
 
     app = Application.builder().token(TOKEN).build()
     app.bot.delete_webhook(drop_pending_updates=True)
