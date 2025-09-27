@@ -63,7 +63,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.data == "new":
         await query.message.edit_text("Выберите тип задачи:", reply_markup=type_menu())
         return CHOOSING_TYPE
@@ -149,6 +148,7 @@ async def enter_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Введите срок (ДД.ММ.ГГ ЧЧ:ММ):")
     return CHOOSING_DATE
 
+# ---- Ввод срока (главное исправление) ----
 async def manual_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["deadline"] = update.message.text
     ud = context.user_data
@@ -160,17 +160,11 @@ async def manual_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
                ud.get("deadline"), "active"))
     conn.commit()
 
-    # Очистка временных данных
     context.user_data.clear()
 
-    # Возвращаем меню через send_message
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="✅ Задача добавлена в текущие!",
-        reply_markup=main_menu()
-    )
+    await update.message.reply_text("✅ Задача добавлена в текущие!", reply_markup=main_menu())
 
-    return ConversationHandler.END
+    return ConversationHandler.END   # <<< Важно: закрываем диалог
 
 # ---- Открыть задачу ----
 async def open_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -254,7 +248,7 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== MAIN ==================
 def main():
-    TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"
+    TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА"
 
     app = Application.builder().token(TOKEN).build()
     app.bot.delete_webhook(drop_pending_updates=True)
