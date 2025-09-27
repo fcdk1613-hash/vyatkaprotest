@@ -1,13 +1,19 @@
+#!/usr/bin/env python3
+# coding: utf-8
+
+import logging
 import sqlite3
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ConversationHandler, ContextTypes
+    MessageHandler, filters, ContextTypes
 )
 
-# ================== БАЗА ==================
+# ---------- ЛОГИ ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+# ---------- БД ----------
 conn = sqlite3.connect("tasks.db", check_same_thread=False)
 c = conn.cursor()
 c.execute("""CREATE TABLE IF NOT EXISTS tasks (
@@ -25,11 +31,7 @@ c.execute("""CREATE TABLE IF NOT EXISTS tasks (
 )""")
 conn.commit()
 
-# ================== СОСТОЯНИЯ ==================
-CHOOSING_TYPE, CHOOSING_CLIENT, ENTER_ORDER, ENTER_ADDRESS, ENTER_DESCRIPTION, \
-ENTER_DEADLINE, WAITING_AVR, WAITING_SOLUTION = range(8)
-
-# ================== КНОПКИ ==================
+# ---------- Кнопки / Меню ----------
 def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Новая задача", callback_data="new")],
@@ -39,141 +41,266 @@ def main_menu():
 
 def type_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📝 Общая", callback_data="general")],
-        [InlineKeyboardButton("🚗 Выездная", callback_data="field")],
+        [InlineKeyboardButton("📝 Общая", callback_data="general"),
+         InlineKeyboardButton("🚗 Выездная", callback_data="field")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
     ])
 
 def client_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏢 Максавит", callback_data="Максавит")],
-        [InlineKeyboardButton("🏭 Газпромнефть", callback_data="Газпромнефть")],
-        [InlineKeyboardButton("👗 Глория Джинс", callback_data="Глория Джинс")],
-        [InlineKeyboardButton("🛒 Перекресток", callback_data="Перекресток")],
-        [InlineKeyboardButton("⛽ Тебойл", callback_data="Тебойл")],
-        [InlineKeyboardButton("⛽ Татнефть", callback_data="Татнефть")],
+        [InlineKeyboardButton("🏢 Максавит", callback_data="Максавит"),
+         InlineKeyboardButton("🏭 Газпромнефть", callback_data="Газпромнефть")],
+        [InlineKeyboardButton("👗 Глория Джинс", callback_data="Глория Джинс"),
+         InlineKeyboardButton("🛒 Перекресток", callback_data="Перекресток")],
+        [InlineKeyboardButton("⛽ Тебойл", callback_data="Тебойл"),
+         InlineKeyboardButton("⛽ Татнефть", callback_data="Татнефть")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
     ])
 
-# ================== ОБРАБОТЧИКИ ==================
+def confirm_delete_kb(tid):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Подтвердить удаление", callback_data=f"confirm_delete_{tid}")],
+        [InlineKeyboardButton("⬅️ Отмена", callback_data=f"open_{tid}")]
+    ])
+
+# ---------- Утилиты ----------
+def clear_state(context: ContextTypes.DEFAULT_TYPE):
+    # удаляем все поля состояния у пользователя
+    keys = ["state", "type", "client", "order_number", "description", "address", "deadline", "complete_id", "avr_temp"]
+    for k in keys:
+        context.user_data.pop(k, None)
+
+# ---------- Хендлеры ----------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("User %s started bot", update.effective_user.id)
+    clear_state(context)
     await update.message.reply_text("👋 Привет! Я бот для управления задачами.", reply_markup=main_menu())
 
-# ---- Главное меню ----
-async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# меню -> кнопки new/current/history/back
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data == "new":
+    data = query.data
+    user_id = query.from_user.id
+    logger.info("menu_callback %s from user %s", data, user_id)
+
+    if data == "new":
+        # начинаем ручной диалог
+        context.user_data.clear()
+        context.user_data["state"] = "choose_type"
         await query.message.edit_text("Выберите тип задачи:", reply_markup=type_menu())
-        return CHOOSING_TYPE
-
-# ---- Текущие задачи ----
-async def show_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    c.execute("SELECT id, type, client, address, description FROM tasks WHERE status='active' ORDER BY id DESC")
-    tasks = c.fetchall()
-    if not tasks:
-        await query.message.reply_text("📭 Нет текущих задач.", reply_markup=main_menu())
         return
-    kb = []
-    for t in tasks:
-        tid, ttype, client, addr, desc = t
-        if ttype == "field":
-            label = f"#{tid} {client} | {addr}"
-        else:
-            label = f"#{tid} {desc[:30]}..."
-        kb.append([InlineKeyboardButton(f"🔎 {label}", callback_data=f"open_{tid}")])
-    kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
-    await query.message.reply_text("📌 Текущие задачи:", reply_markup=InlineKeyboardMarkup(kb))
 
-# ---- История ----
-async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    c.execute("SELECT id, type, client, address, description FROM tasks WHERE status='done' ORDER BY id DESC LIMIT 10")
-    tasks = c.fetchall()
-    if not tasks:
-        await query.message.reply_text("📭 История пуста.", reply_markup=main_menu())
+    if data == "current":
+        # показать текущие (active)
+        c.execute("SELECT id, type, client, address, description FROM tasks WHERE status='active' ORDER BY id DESC")
+        rows = c.fetchall()
+        if not rows:
+            await query.message.reply_text("📭 Нет текущих задач.", reply_markup=main_menu())
+            return
+        kb = []
+        for tid, ttype, client, addr, desc in rows:
+            if ttype == "field":
+                label = f"#{tid} {client} | {addr}"
+            else:
+                label = f"#{tid} {desc[:30]}..."
+            kb.append([InlineKeyboardButton(f"🔎 {label}", callback_data=f"open_{tid}")])
+        kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
+        await query.message.reply_text("📌 Текущие задачи:", reply_markup=InlineKeyboardMarkup(kb))
         return
-    kb = []
-    for t in tasks:
-        tid, ttype, client, addr, desc = t
-        if ttype == "field":
-            label = f"#{tid} {client} | {addr}"
+
+    if data == "history":
+        # показать завершённые (done)
+        c.execute("SELECT id, type, client, address, description FROM tasks WHERE status='done' ORDER BY id DESC LIMIT 30")
+        rows = c.fetchall()
+        if not rows:
+            await query.message.reply_text("📭 История пуста.", reply_markup=main_menu())
+            return
+        kb = []
+        for tid, ttype, client, addr, desc in rows:
+            if ttype == "field":
+                label = f"#{tid} {client} | {addr}"
+            else:
+                label = f"#{tid} {desc[:30]}..."
+            kb.append([InlineKeyboardButton(f"📜 {label}", callback_data=f"open_{tid}")])
+        kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
+        await query.message.reply_text("📜 История задач:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if data == "back_main":
+        clear_state(context)
+        await query.message.edit_text("🏠 Главное меню:", reply_markup=main_menu())
+        return
+
+# кнопки внутри диалога: выбор типа и клиента
+async def dialog_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    state = context.user_data.get("state")
+    logger.info("dialog_buttons data=%s state=%s user=%s", data, state, query.from_user.id)
+
+    # если ожидается выбор типа
+    if state == "choose_type" and data in ("general", "field"):
+        context.user_data["type"] = data
+        if data == "field":
+            context.user_data["state"] = "choose_client"
+            await query.message.edit_text("Выберите клиента:", reply_markup=client_menu())
+            return
         else:
-            label = f"#{tid} {desc[:30]}..."
-        kb.append([InlineKeyboardButton(f"📜 {label}", callback_data=f"open_{tid}")])
-    kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
-    await query.message.reply_text("📜 История завершённых задач:", reply_markup=InlineKeyboardMarkup(kb))
+            # общая: запрашиваем описание
+            context.user_data["state"] = "await_description"
+            await query.message.edit_text("Введите описание задачи:")
+            return
 
-# ---- Назад ----
-async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.message.edit_text("🏠 Главное меню:", reply_markup=main_menu())
-    return ConversationHandler.END
+    # выбор клиента в выездной задаче
+    if state == "choose_client":
+        # кнопка клиента пришла
+        context.user_data["client"] = data
+        context.user_data["state"] = "await_order"
+        await query.message.edit_text("Введите номер заявки:")
+        return
 
-# ---- Создание задач ----
-async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    context.user_data["type"] = query.data
-    await query.answer()
-    if query.data == "field":
-        await query.message.edit_text("Выберите клиента:", reply_markup=client_menu())
-        return CHOOSING_CLIENT
-    else:
-        await query.message.edit_text("Введите описание задачи:")
-        return ENTER_DESCRIPTION
+    # кнопки для задач (open, complete, delete, confirm_delete)
+    if data.startswith("open_"):
+        # передаем в global open handler — но здесь можно просто вызвать open_task
+        await open_task(update, context)
+        return
 
-async def choose_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    context.user_data["client"] = query.data
-    await query.answer()
-    await query.message.edit_text("Введите номер заявки:")
-    return ENTER_ORDER
+    if data.startswith("complete_"):
+        await complete_task(update, context)
+        return
 
-async def enter_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["order_number"] = update.message.text
-    await update.message.reply_text("Введите адрес:")
-    return ENTER_ADDRESS
+    if data.startswith("delete_"):
+        await delete_task(update, context)
+        return
 
-async def enter_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["address"] = update.message.text
-    await update.message.reply_text("Введите описание задачи:")
-    return ENTER_DESCRIPTION
+    if data.startswith("confirm_delete_"):
+        await confirm_delete(update, context)
+        return
 
-async def enter_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["description"] = update.message.text
-    await update.message.reply_text("Введите срок (ДД.ММ.ГГ ЧЧ:ММ):")
-    return ENTER_DEADLINE
+    logger.warning("Unhandled dialog button: %s (state=%s)", data, state)
 
-# ---- Ввод срока ----
-async def enter_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["deadline"] = update.message.text
-    ud = context.user_data
+# Текстовые сообщения — единый маршрутизатор по состоянию
+async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user.id
+    text = update.message.text.strip() if update.message.text else ""
+    state = context.user_data.get("state")
+    logger.info("text_message_handler user=%s state=%s text=%s", user, state, text[:60])
 
-    c.execute("""INSERT INTO tasks (user_id, type, client, order_number, description, address, deadline, status)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-              (update.effective_user.id, ud.get("type"), ud.get("client"),
-               ud.get("order_number"), ud.get("description"), ud.get("address"),
-               ud.get("deadline"), "active"))
-    conn.commit()
+    # если нет состояния — игнорируем текст (пригласим в меню)
+    if not state:
+        await update.message.reply_text("Нажмите кнопку в меню.", reply_markup=main_menu())
+        return
 
-    context.user_data.clear()
+    # Ожидаем номер заявки (выездная)
+    if state == "await_order":
+        context.user_data["order_number"] = text
+        context.user_data["state"] = "await_address"
+        await update.message.reply_text("Введите адрес:")
+        return
 
-    await update.message.reply_text("✅ Задача добавлена в текущие!", reply_markup=main_menu())
+    # Ожидаем адрес (выездная)
+    if state == "await_address":
+        context.user_data["address"] = text
+        context.user_data["state"] = "await_description"
+        await update.message.reply_text("Введите описание задачи:")
+        return
 
-    return ConversationHandler.END
+    # Ожидаем описание (общая или выездная после адрес)
+    if state == "await_description":
+        context.user_data["description"] = text
+        context.user_data["state"] = "await_deadline"
+        await update.message.reply_text("Введите срок (ДД.ММ.ГГ ЧЧ:ММ):")
+        return
 
-# ---- Открыть задачу ----
+    # Ожидаем срок — ЗДЕСЬ сохраняем задачу и закрываем диалог
+    if state == "await_deadline":
+        context.user_data["deadline"] = text
+        ud = context.user_data.copy()
+        # вставляем в БД
+        try:
+            c.execute("""INSERT INTO tasks (user_id, type, client, order_number, description, address, deadline, status)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                      (user, ud.get("type"), ud.get("client"),
+                       ud.get("order_number"), ud.get("description"), ud.get("address"),
+                       ud.get("deadline"), "active"))
+            conn.commit()
+            tid = c.lastrowid
+            logger.info("Task %s created by user %s", tid, user)
+        except Exception as e:
+            logger.exception("DB insert failed")
+            await update.message.reply_text("❌ Ошибка при сохранении задачи. Попробуйте ещё раз.", reply_markup=main_menu())
+            context.user_data.clear()
+            return
+
+        # очистка состояния
+        context.user_data.clear()
+
+        # ответ и главное меню
+        await update.message.reply_text(f"✅ Задача #{tid} добавлена в текущие!", reply_markup=main_menu())
+        return
+
+    # Ожидаем текст решения после АВР (complete flow)
+    if state == "await_solution":
+        tid = context.user_data.get("complete_id")
+        if not tid:
+            await update.message.reply_text("❌ Внутренняя ошибка: id задачи не найден.")
+            context.user_data.clear()
+            return
+        sol = text
+        c.execute("UPDATE tasks SET solution=?, status=? WHERE id=?", (sol, "done", tid))
+        conn.commit()
+        context.user_data.clear()
+        await update.message.reply_text(f"✅ Задача #{tid} завершена и перенесена в историю!", reply_markup=main_menu())
+        return
+
+    # Любой другой state — ответим подсказкой
+    await update.message.reply_text("Я пока не знаю, что с этим делать. Нажмите меню.", reply_markup=main_menu())
+
+# Документы (для АВР)
+async def document_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user.id
+    state = context.user_data.get("state")
+    logger.info("document_message_handler user=%s state=%s", user, state)
+
+    # ожидание прикрепления АВР
+    if state == "await_avr":
+        if not update.message.document:
+            await update.message.reply_text("Пожалуйста, пришлите файл (документ).")
+            return
+        tid = context.user_data.get("complete_id")
+        if not tid:
+            await update.message.reply_text("Внутренняя ошибка: id задачи не найден.")
+            context.user_data.clear()
+            return
+        doc = await update.message.document.get_file()
+        path = f"avr_{tid}.pdf"
+        await doc.download_to_drive(path)
+        c.execute("UPDATE tasks SET avr=? WHERE id=?", (path, tid))
+        conn.commit()
+        # переключаем ожидание на текст решения
+        context.user_data["state"] = "await_solution"
+        await update.message.reply_text("✅ АВР получен. Теперь опишите решение:")
+        return
+
+    # если документ пришёл не в нужный момент
+    await update.message.reply_text("Я пока не ожидаю документ. Нажмите меню.", reply_markup=main_menu())
+
+# Открыть задачу — карточка
 async def open_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    tid = int(query.data.split("_")[1])
-    c.execute("SELECT * FROM tasks WHERE id=?", (tid,))
-    row = c.fetchone()
-    if row:
+    if query:
+        await query.answer()
+        tid = int(query.data.split("_")[1])
+        logger.info("open_task tid=%s user=%s", tid, query.from_user.id)
+        # fetch
+        c.execute("SELECT * FROM tasks WHERE id=?", (tid,))
+        row = c.fetchone()
+        if not row:
+            await query.message.reply_text("❌ Задача не найдена.", reply_markup=main_menu())
+            return
         _, user_id, ttype, client, order, desc, addr, deadline, avr, sol, status = row
         msg = (
             f"🆔 <b>Задача #{tid}</b>\n"
@@ -189,7 +316,6 @@ async def open_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if status == "done":
             if sol: msg += f"📝 <b>Решение:</b> {sol}\n"
-            if avr: await query.message.reply_document(document=InputFile(avr), caption="📎 АВР")
 
         keyboard = []
         if status != "done":
@@ -197,92 +323,81 @@ async def open_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_{tid}")])
         keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
 
-        await query.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard),
-                                       parse_mode="HTML", disable_web_page_preview=True)
+        await query.message.reply_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard),
+                                       disable_web_page_preview=True)
+        # Если есть avr и задача завершена — отправим документ
+        if status == "done" and avr:
+            try:
+                await query.message.reply_document(document=InputFile(avr), caption="📎 АВР")
+            except Exception:
+                logger.exception("Failed to send AVR file")
+        return
+    # если вызван не через callback (редко), игнорим
+    await update.message.reply_text("Ошибка открытия задачи.", reply_markup=main_menu())
 
-# ---- Завершение ----
+# Начало завершения — просим файл (АВР)
 async def complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     tid = int(query.data.split("_")[1])
+    logger.info("User %s starts completing task %s", query.from_user.id, tid)
     context.user_data["complete_id"] = tid
+    context.user_data["state"] = "await_avr"
     await query.message.reply_text("📎 Прикрепите АВР (файл):")
-    return WAITING_AVR
+    return
 
-async def receive_avr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tid = context.user_data["complete_id"]
-    file = await update.message.document.get_file()
-    path = f"avr_{tid}.pdf"
-    await file.download_to_drive(path)
-    c.execute("UPDATE tasks SET avr=? WHERE id=?", (path, tid))
-    conn.commit()
-    await update.message.reply_text("✅ АВР получен. Теперь опишите решение:")
-    return WAITING_SOLUTION
-
-async def receive_solution(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tid = context.user_data["complete_id"]
-    sol = update.message.text
-    c.execute("UPDATE tasks SET solution=?, status=? WHERE id=?", (sol, "done", tid))
-    conn.commit()
-    await update.message.reply_text("✅ Задача завершена и перенесена в историю!", reply_markup=main_menu())
-    return ConversationHandler.END
-
-# ---- Удаление ----
+# Удаление — запрос подтверждения
 async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     tid = int(query.data.split("_")[1])
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Подтвердить удаление", callback_data=f"confirm_delete_{tid}")],
-        [InlineKeyboardButton("⬅️ Отмена", callback_data=f"open_{tid}")]
-    ])
-    await query.message.reply_text(f"⚠️ Удалить задачу #{tid}?", reply_markup=kb)
+    logger.info("User %s asks delete for %s", query.from_user.id, tid)
+    await query.message.reply_text(f"⚠️ Удалить задачу #{tid}?", reply_markup=confirm_delete_kb(tid))
+    return
 
 async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    tid = int(query.data.split("_")[2])
-    c.execute("DELETE FROM tasks WHERE id=?", (tid,))
-    conn.commit()
-    await query.message.reply_text(f"🗑 Задача #{tid} удалена.", reply_markup=main_menu())
+    # формат confirm_delete_123
+    parts = query.data.split("_")
+    if len(parts) >= 3:
+        tid = int(parts[2])
+        c.execute("DELETE FROM tasks WHERE id=?", (tid,))
+        conn.commit()
+        logger.info("Task %s deleted by user %s", tid, query.from_user.id)
+        await query.message.reply_text(f"🗑 Задача #{tid} удалена.", reply_markup=main_menu())
+        return
+    await query.message.reply_text("❌ Ошибка удаления.", reply_markup=main_menu())
+    return
 
-# ================== MAIN ==================
+# ---------- Запуск ----------
 def main():
-    TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"
-
+    TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА"  # <- Вставь токен
     app = Application.builder().token(TOKEN).build()
-    app.bot.delete_webhook(drop_pending_updates=True)
 
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(menu_handler, pattern="^new$")],
-        states={
-            CHOOSING_TYPE: [CallbackQueryHandler(choose_type, pattern="^(general|field)$")],
-            CHOOSING_CLIENT: [CallbackQueryHandler(choose_client)],
-            ENTER_ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_order)],
-            ENTER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_address)],
-            ENTER_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_description)],
-            ENTER_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_deadline)],
-            WAITING_AVR: [MessageHandler(filters.Document.ALL, receive_avr)],
-            WAITING_SOLUTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_solution)],
-        },
-        fallbacks=[CallbackQueryHandler(back_to_main, pattern="^back_main$")],
-    )
-
+    # командный хэндлер
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv)
 
-    # глобальные кнопки
-    app.add_handler(CallbackQueryHandler(show_current, pattern="^current$"))
-    app.add_handler(CallbackQueryHandler(show_history, pattern="^history$"))
-    app.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_main$"))
+    # клавиши главного меню
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern="^(new|current|history|back_main)$"))
 
-    # задачи
+    # кнопки диалога (выбор типа, выбор клиента, open/complete/delete/confirm_delete)
+    app.add_handler(CallbackQueryHandler(dialog_buttons, pattern="^(general|field|Максавит|Газпромнефть|Глория Джинс|Перекресток|Тебойл|Татнефть|open_\\d+|complete_\\d+|delete_\\d+|confirm_delete_\\d+)$"))
+
+    # кнопки отдельно для open/complete/delete/confirm_delete чтобы быть безопаснее (дублируем)
     app.add_handler(CallbackQueryHandler(open_task, pattern=r"^open_\d+$"))
     app.add_handler(CallbackQueryHandler(complete_task, pattern=r"^complete_\d+$"))
     app.add_handler(CallbackQueryHandler(delete_task, pattern=r"^delete_\d+$"))
     app.add_handler(CallbackQueryHandler(confirm_delete, pattern=r"^confirm_delete_\d+$"))
 
-    app.run_polling()
+    # текстовые сообщения — единый обработчик состояния
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
+
+    # документы — обработчик для АВР
+    app.add_handler(MessageHandler(filters.Document.ALL, document_message_handler))
+
+    logger.info("Bot starting...")
+    app.run_polling(allowed_updates=["message", "callback_query", "document"])
 
 if __name__ == "__main__":
     main()
