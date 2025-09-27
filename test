@@ -15,7 +15,8 @@ c.execute("""CREATE TABLE IF NOT EXISTS tasks (
     user_id INTEGER,
     type TEXT,
     client TEXT,
-    text TEXT,
+    order_number TEXT,
+    description TEXT,
     address TEXT,
     deadline TEXT,
     avr TEXT,
@@ -25,8 +26,8 @@ c.execute("""CREATE TABLE IF NOT EXISTS tasks (
 conn.commit()
 
 # ================== СОСТОЯНИЯ ==================
-CHOOSING_TYPE, CHOOSING_CLIENT, ENTER_TEXT, ENTER_ADDRESS, \
-CHOOSING_DATE, WAITING_AVR, WAITING_SOLUTION, HISTORY_FILTER = range(8)
+CHOOSING_TYPE, CHOOSING_CLIENT, ENTER_ORDER, ENTER_ADDRESS, ENTER_DESCRIPTION, \
+CHOOSING_DATE, WAITING_AVR, WAITING_SOLUTION, HISTORY_FILTER = range(9)
 
 # ================== КНОПКИ ==================
 def main_menu():
@@ -67,23 +68,37 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CHOOSING_TYPE
 
     elif query.data == "current":
-        c.execute("SELECT id, text FROM tasks WHERE status='active' ORDER BY id DESC")
+        c.execute("SELECT id, type, client, address, description FROM tasks WHERE status='active' ORDER BY id DESC")
         tasks = c.fetchall()
         if not tasks:
             await query.message.reply_text("📭 Нет текущих задач.", reply_markup=main_menu())
             return ConversationHandler.END
-        kb = [[InlineKeyboardButton(f"🔎 {t[1][:30]}...", callback_data=f"open_{t[0]}")] for t in tasks]
+        kb = []
+        for t in tasks:
+            tid, ttype, client, addr, desc = t
+            if ttype == "field":
+                label = f"{client} | {addr}"
+            else:
+                label = f"{desc[:30]}..."
+            kb.append([InlineKeyboardButton(f"🔎 {label}", callback_data=f"open_{tid}")])
         kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
         await query.message.reply_text("📌 Текущие задачи:", reply_markup=InlineKeyboardMarkup(kb))
         return HISTORY_FILTER
 
     elif query.data == "history":
-        c.execute("SELECT id, text FROM tasks WHERE status='done' ORDER BY id DESC LIMIT 10")
+        c.execute("SELECT id, type, client, address, description FROM tasks WHERE status='done' ORDER BY id DESC LIMIT 10")
         tasks = c.fetchall()
         if not tasks:
             await query.message.reply_text("📭 История пуста.", reply_markup=main_menu())
             return ConversationHandler.END
-        kb = [[InlineKeyboardButton(f"📜 {t[1][:30]}...", callback_data=f"open_{t[0]}")] for t in tasks]
+        kb = []
+        for t in tasks:
+            tid, ttype, client, addr, desc = t
+            if ttype == "field":
+                label = f"{client} | {addr}"
+            else:
+                label = f"{desc[:30]}..."
+            kb.append([InlineKeyboardButton(f"📜 {label}", callback_data=f"open_{tid}")])
         kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
         await query.message.reply_text("📜 История завершённых задач:", reply_markup=InlineKeyboardMarkup(kb))
         return HISTORY_FILTER
@@ -100,45 +115,45 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text("Выберите клиента:", reply_markup=client_menu())
         return CHOOSING_CLIENT
     else:
-        await query.message.edit_text("Введите текст задачи:")
-        return ENTER_TEXT
+        await query.message.edit_text("Введите описание задачи:")
+        return ENTER_DESCRIPTION
 
 async def choose_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     context.user_data["client"] = query.data
     await query.answer()
-    await query.message.edit_text("Введите текст задачи:")
-    return ENTER_TEXT
+    await query.message.edit_text("Введите номер заявки:")
+    return ENTER_ORDER
 
-async def enter_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["text"] = update.message.text
-    if context.user_data.get("type") == "field":
-        await update.message.reply_text("Введите адрес:")
-        return ENTER_ADDRESS
-    else:
-        await update.message.reply_text("Введите срок (например, 2025-09-30 14:00):")
-        return CHOOSING_DATE
+async def enter_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["order_number"] = update.message.text
+    await update.message.reply_text("Введите адрес:")
+    return ENTER_ADDRESS
 
 async def enter_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["address"] = update.message.text
-    await update.message.reply_text("Введите срок (например, 2025-09-30 14:00):")
+    await update.message.reply_text("Введите описание задачи:")
+    return ENTER_DESCRIPTION
+
+async def enter_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["description"] = update.message.text
+    await update.message.reply_text("Введите срок (ДД.ММ.ГГ ЧЧ:ММ):")
     return CHOOSING_DATE
 
 async def manual_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["deadline"] = update.message.text
     ud = context.user_data
-    c.execute("""INSERT INTO tasks (user_id, type, client, text, address, deadline, status)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
+    c.execute("""INSERT INTO tasks (user_id, type, client, order_number, description, address, deadline, status)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
               (update.effective_user.id, ud.get("type"), ud.get("client"),
-               ud.get("text"), ud.get("address"), ud.get("deadline"), "active"))
+               ud.get("order_number"), ud.get("description"), ud.get("address"),
+               ud.get("deadline"), "active"))
     conn.commit()
 
-    await update.message.reply_text(
-        "✅ Задача добавлена в текущие!",
-        reply_markup=main_menu()
-    )
+    await update.message.reply_text("✅ Задача добавлена в текущие!", reply_markup=main_menu())
     return ConversationHandler.END
 
+# ====== ОТКРЫТИЕ ЗАДАЧИ ======
 async def open_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -146,33 +161,33 @@ async def open_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c.execute("SELECT * FROM tasks WHERE id=?", (tid,))
     row = c.fetchone()
     if row:
-        _, user_id, ttype, client, text, addr, deadline, avr, sol, status = row
+        _, user_id, ttype, client, order, desc, addr, deadline, avr, sol, status = row
         msg = (
             f"🆔 <b>Задача #{tid}</b>\n"
             f"📌 <b>Тип:</b> {'🚗 Выездная' if ttype == 'field' else '📝 Общая'}\n"
-            f"📝 <b>Описание:</b> {text}\n"
-            f"⏰ <b>Срок:</b> {deadline}\n"
-            f"📊 <b>Статус:</b> {'✅ Завершена' if status == 'done' else '🕒 Активна'}\n"
         )
-        if client:
-            msg += f"🏢 <b>Клиент:</b> {client}\n"
+        if client: msg += f"🏢 <b>Клиент:</b> {client}\n"
+        if order: msg += f"№ <b>Заявки:</b> {order}\n"
+        msg += f"📝 <b>Описание:</b> {desc}\n"
         if addr:
             msg += f"📍 <b>Адрес:</b> {addr}\n🔗 <a href='https://yandex.ru/maps/?text={addr}'>Открыть в Яндекс.Картах</a>\n"
+        msg += f"⏰ <b>Срок:</b> {deadline}\n"
+        msg += f"📊 <b>Статус:</b> {'✅ Завершена' if status == 'done' else '🕒 Активна'}\n"
 
         if status == "done":
-            if sol:
-                msg += f"📝 <b>Решение:</b> {sol}\n"
-            if avr:
-                await query.message.reply_document(document=InputFile(avr), caption="📎 АВР")
+            if sol: msg += f"📝 <b>Решение:</b> {sol}\n"
+            if avr: await query.message.reply_document(document=InputFile(avr), caption="📎 АВР")
 
         keyboard = []
         if status != "done":
             keyboard.append([InlineKeyboardButton("✅ Завершить", callback_data=f"complete_{tid}")])
+        keyboard.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_{tid}")])
         keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
 
         await query.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard),
                                        parse_mode="HTML", disable_web_page_preview=True)
 
+# ====== ЗАВЕРШЕНИЕ ======
 async def complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -199,12 +214,32 @@ async def receive_solution(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Задача завершена и перенесена в историю!", reply_markup=main_menu())
     return ConversationHandler.END
 
+# ====== УДАЛЕНИЕ ======
+async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tid = int(query.data.split("_")[1])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Подтвердить удаление", callback_data=f"confirm_delete_{tid}")],
+        [InlineKeyboardButton("⬅️ Отмена", callback_data=f"open_{tid}")]
+    ])
+    await query.message.reply_text(f"⚠️ Вы уверены, что хотите удалить задачу #{tid}?", reply_markup=kb)
+
+async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tid = int(query.data.split("_")[2])
+    c.execute("DELETE FROM tasks WHERE id=?", (tid,))
+    conn.commit()
+    await query.message.reply_text(f"🗑 Задача #{tid} удалена.", reply_markup=main_menu())
+
+# ====== HISTORY FILTER ======
 async def history_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ================== MAIN ==================
 def main():
-    TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"  # 🔑 токен от BotFather
+    TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА"
 
     app = Application.builder().token(TOKEN).build()
     app.bot.delete_webhook(drop_pending_updates=True)
@@ -214,8 +249,9 @@ def main():
         states={
             CHOOSING_TYPE: [CallbackQueryHandler(choose_type, pattern="^(general|field)$")],
             CHOOSING_CLIENT: [CallbackQueryHandler(choose_client)],
-            ENTER_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_text)],
+            ENTER_ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_order)],
             ENTER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_address)],
+            ENTER_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_description)],
             CHOOSING_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_date)],
             WAITING_AVR: [MessageHandler(filters.Document.ALL, receive_avr)],
             WAITING_SOLUTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_solution)],
@@ -227,9 +263,10 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv)
 
-    # 🔑 Эти кнопки идут напрямую в свои обработчики
     app.add_handler(CallbackQueryHandler(open_task, pattern=r"^open_\d+$"))
     app.add_handler(CallbackQueryHandler(complete_task, pattern=r"^complete_\d+$"))
+    app.add_handler(CallbackQueryHandler(delete_task, pattern=r"^delete_\d+$"))
+    app.add_handler(CallbackQueryHandler(confirm_delete, pattern=r"^confirm_delete_\d+$"))
 
     app.run_polling()
 
