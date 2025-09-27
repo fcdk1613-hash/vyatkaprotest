@@ -289,7 +289,7 @@ async def open_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     # Читаем токен из переменной окружения
-    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    TOKEN = os.getenv("8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY")
     if not TOKEN:
         print("❌ Ошибка: TELEGRAM_BOT_TOKEN не найден. Установите переменную окружения.")
         return
