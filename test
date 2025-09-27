@@ -27,7 +27,7 @@ conn.commit()
 
 # ================== СОСТОЯНИЯ ==================
 CHOOSING_TYPE, CHOOSING_CLIENT, ENTER_ORDER, ENTER_ADDRESS, ENTER_DESCRIPTION, \
-CHOOSING_DATE, WAITING_AVR, WAITING_SOLUTION = range(8)
+ENTER_DEADLINE, WAITING_AVR, WAITING_SOLUTION = range(8)
 
 # ================== КНОПКИ ==================
 def main_menu():
@@ -146,10 +146,10 @@ async def enter_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def enter_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["description"] = update.message.text
     await update.message.reply_text("Введите срок (ДД.ММ.ГГ ЧЧ:ММ):")
-    return CHOOSING_DATE
+    return ENTER_DEADLINE
 
-# ---- Ввод срока (главное исправление) ----
-async def manual_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---- Ввод срока ----
+async def enter_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["deadline"] = update.message.text
     ud = context.user_data
 
@@ -164,7 +164,7 @@ async def manual_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("✅ Задача добавлена в текущие!", reply_markup=main_menu())
 
-    return ConversationHandler.END   # <<< Важно: закрываем диалог
+    return ConversationHandler.END
 
 # ---- Открыть задачу ----
 async def open_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -248,7 +248,7 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== MAIN ==================
 def main():
-    TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"
+    TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА"
 
     app = Application.builder().token(TOKEN).build()
     app.bot.delete_webhook(drop_pending_updates=True)
@@ -261,7 +261,7 @@ def main():
             ENTER_ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_order)],
             ENTER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_address)],
             ENTER_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_description)],
-            CHOOSING_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_date)],
+            ENTER_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_deadline)],
             WAITING_AVR: [MessageHandler(filters.Document.ALL, receive_avr)],
             WAITING_SOLUTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_solution)],
         },
