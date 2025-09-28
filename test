@@ -36,7 +36,7 @@ from telegram.ext import (
 )
 
 # ---------- Настройки ----------
-TOKEN = "ВАШ_ТОКЕН"  # <- Вставь сюда токен бота
+TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"  # <- Вставь сюда токен бота
 
 FILES_DIR = "data_files"  # папка для сохранения АВР файлов
 os.makedirs(FILES_DIR, exist_ok=True)
