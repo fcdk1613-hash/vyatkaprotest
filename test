@@ -1,223 +1,364 @@
 import logging
 import sqlite3
-import json
+from datetime import datetime
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputFile
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    ConversationHandler, MessageHandler, ContextTypes, filters
+    MessageHandler, ConversationHandler, ContextTypes, filters
 )
 
-# ----------------- ЛОГИ -----------------
+# === ВСТАВЬ СВОЙ ТОКЕН НИЖЕ ===
+TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"
+
+# === ЛОГИ ===
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ----------------- БД -----------------
-conn = sqlite3.connect("tasks.db", check_same_thread=False)
-c = conn.cursor()
-c.execute("""CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    type TEXT,
-    client TEXT,
-    order_number TEXT,
-    description TEXT,
-    address TEXT,
-    deadline TEXT,
-    avr TEXT,
-    solution TEXT,
-    status TEXT
-)""")
-conn.commit()
+# === СОСТОЯНИЯ ДЛЯ FSM ===
+(
+    MAIN_MENU,
+    NEW_TASK_TYPE,
+    GENERAL_TEXT,
+    TRAVEL_NUMBER,
+    TRAVEL_CLIENT,
+    TRAVEL_ADDRESS,
+    TRAVEL_DESCRIPTION,
+    TRAVEL_DEADLINE,
+    CLOSE_AVR,
+    CLOSE_SOLUTION,
+) = range(10)
 
-# ----------------- СОСТОЯНИЯ -----------------
-CHOOSING_TYPE, CHOOSING_CLIENT, ENTER_ORDER, ENTER_ADDRESS, ENTER_DESCRIPTION, ENTER_DEADLINE, ADD_AVR, ADD_SOLUTION = range(8)
+# === КЛИЕНТЫ ===
+CLIENTS = ["Максавит", "Газпромнефть", "Глория Джинс", "Перекресток", "Тебойл", "Татнефть"]
 
-# ----------------- КЛАВИАТУРЫ -----------------
-def main_menu():
+# === СОЗДАНИЕ БАЗЫ ===
+def init_db():
+    conn = sqlite3.connect("tasks.db")
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT,
+        number TEXT,
+        client TEXT,
+        address TEXT,
+        description TEXT,
+        deadline TEXT,
+        status TEXT,
+        avr_file TEXT,
+        solution TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+# === КНОПКИ ГЛАВНОГО МЕНЮ ===
+def main_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Новая задача", callback_data="new_task")],
         [InlineKeyboardButton("📋 Мои задачи", callback_data="my_tasks")],
-        [InlineKeyboardButton("📂 История", callback_data="history")]
+        [InlineKeyboardButton("📂 История", callback_data="history")],
     ])
 
-def clients_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Максавит", callback_data="client_Максавит")],
-        [InlineKeyboardButton("Газпромнефть", callback_data="client_Газпромнефть")],
-        [InlineKeyboardButton("Глория Джинс", callback_data="client_Глория Джинс")],
-        [InlineKeyboardButton("Перекресток", callback_data="client_Перекресток")],
-        [InlineKeyboardButton("Тебойл", callback_data="client_Тебойл")],
-        [InlineKeyboardButton("Татнефть", callback_data="client_Татнефть")]
-    ])
-
-def done_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Готово ✅", callback_data="done_avr")]
-    ])
-
-# ----------------- ХЕНДЛЕРЫ -----------------
+# === START ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Привет! Выберите действие:", reply_markup=main_menu())
+    await update.message.reply_text(
+        "👋 Привет! Я бот для управления задачами.\nВыберите действие:",
+        reply_markup=main_menu_keyboard()
+    )
+    return MAIN_MENU
 
-async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# === ВЫБОР ТИПА ЗАДАЧИ ===
+async def new_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data == "new_task":
-        context.user_data.clear()
-        context.user_data["type"] = "Выездная"
-        await query.message.reply_text("Выберите клиента:", reply_markup=clients_keyboard())
-        return CHOOSING_CLIENT
-    elif query.data == "my_tasks":
-        user = query.from_user.id
-        c.execute("SELECT id, client, address, description, deadline FROM tasks WHERE user_id=? AND status='active'", (user,))
-        tasks = c.fetchall()
-        if not tasks:
-            await query.message.reply_text("У вас нет активных задач.", reply_markup=main_menu())
-        else:
-            kb = [[InlineKeyboardButton(f"{t[1]} — {t[2]}", callback_data=f"task_{t[0]}")] for t in tasks]
-            await query.message.reply_text("📋 Ваши задачи:", reply_markup=InlineKeyboardMarkup(kb))
-    elif query.data == "history":
-        user = query.from_user.id
-        c.execute("SELECT id, client, address FROM tasks WHERE user_id=? AND status='closed'", (user,))
-        tasks = c.fetchall()
-        if not tasks:
-            await query.message.reply_text("История пуста.", reply_markup=main_menu())
-        else:
-            kb = [[InlineKeyboardButton(f"{t[1]} — {t[2]}", callback_data=f"history_{t[0]}")] for t in tasks]
-            await query.message.reply_text("📂 История заявок:", reply_markup=InlineKeyboardMarkup(kb))
 
-async def choose_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("📝 Общая задача", callback_data="general")],
+        [InlineKeyboardButton("🚗 Выездная задача", callback_data="travel")],
+        [InlineKeyboardButton("⬅ Назад", callback_data="back_main")]
+    ]
+    await query.edit_message_text("Выберите тип задачи:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return NEW_TASK_TYPE
+
+# === СОЗДАНИЕ ОБЩЕЙ ЗАДАЧИ ===
+async def general_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    client = query.data.split("_", 1)[1]
+    await query.edit_message_text("✏ Введите текст задачи:")
+    return GENERAL_TEXT
+
+async def save_general_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    conn = sqlite3.connect("tasks.db")
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO tasks (type, description, status) VALUES (?, ?, ?)",
+        ("general", text, "current")
+    )
+    conn.commit()
+    conn.close()
+    await update.message.reply_text("✅ Общая задача сохранена.", reply_markup=main_menu_keyboard())
+    return MAIN_MENU
+
+# === СОЗДАНИЕ ВЫЕЗДНОЙ ЗАДАЧИ ===
+async def travel_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Введите номер заявки:")
+    return TRAVEL_NUMBER
+
+async def save_travel_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["number"] = update.message.text
+    keyboard = [[InlineKeyboardButton(c, callback_data=f"client_{c}")] for c in CLIENTS]
+    await update.message.reply_text("Выберите клиента:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return TRAVEL_CLIENT
+
+async def save_travel_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    client = query.data.replace("client_", "")
     context.user_data["client"] = client
-    await query.message.reply_text("Введите номер заявки:")
-    return ENTER_ORDER
+    await query.edit_message_text("Введите адрес:")
+    return TRAVEL_ADDRESS
 
-async def enter_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["order_number"] = update.message.text
-    await update.message.reply_text("Введите адрес:")
-    return ENTER_ADDRESS
-
-async def enter_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save_travel_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["address"] = update.message.text
     await update.message.reply_text("Введите описание задачи:")
-    return ENTER_DESCRIPTION
+    return TRAVEL_DESCRIPTION
 
-async def enter_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save_travel_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["description"] = update.message.text
-    await update.message.reply_text("Введите срок (ДД.ММ.ГГ ЧЧ:ММ):")
-    return ENTER_DEADLINE
+    await update.message.reply_text("Введите срок в формате ДД.ММ.ГГ ЧЧ:ММ")
+    return TRAVEL_DEADLINE
 
-async def enter_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["deadline"] = update.message.text
-    user = update.message.from_user.id
-    ud = context.user_data
-    c.execute("""INSERT INTO tasks (user_id, type, client, order_number, description, address, deadline, status)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-              (user, ud["type"], ud["client"], ud["order_number"], ud["description"], ud["address"], ud["deadline"], "active"))
+async def save_travel_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    deadline = update.message.text
+    try:
+        datetime.strptime(deadline, "%d.%m.%y %H:%M")
+    except ValueError:
+        await update.message.reply_text("⚠ Неверный формат. Попробуйте снова: ДД.ММ.ГГ ЧЧ:ММ")
+        return TRAVEL_DEADLINE
+
+    context.user_data["deadline"] = deadline
+    data = context.user_data
+    conn = sqlite3.connect("tasks.db")
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO tasks (type, number, client, address, description, deadline, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("travel", data["number"], data["client"], data["address"], data["description"], data["deadline"], "current")
+    )
     conn.commit()
-    tid = c.lastrowid
-    ud["task_id"] = tid
-    ud["avr_files"] = []
-    await update.message.reply_text("📎 Прикрепите АВР (pdf/jpg/png/heic). Когда закончите — нажмите кнопку:", reply_markup=done_keyboard())
-    return ADD_AVR
+    conn.close()
+    await update.message.reply_text("✅ Выездная задача сохранена.", reply_markup=main_menu_keyboard())
+    return MAIN_MENU
 
-async def add_avr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tid = context.user_data.get("task_id")
-    file = update.message.document or update.message.photo[-1]
+# === ПРОСМОТР МОИХ ЗАДАЧ ===
+async def my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    conn = sqlite3.connect("tasks.db")
+    cur = conn.cursor()
+    cur.execute("SELECT id, type, number, client, address, description, deadline FROM tasks WHERE status='current'")
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await query.edit_message_text("📋 У вас нет текущих задач.", reply_markup=main_menu_keyboard())
+        return MAIN_MENU
+
+    keyboard = []
+    for row in rows:
+        if row[1] == "travel":
+            keyboard.append([InlineKeyboardButton(f"🚗 {row[3]} | {row[4]}", callback_data=f"task_{row[0]}")])
+        else:
+            keyboard.append([InlineKeyboardButton(f"📝 {row[5]}", callback_data=f"task_{row[0]}")])
+
+    keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="back_main")])
+    await query.edit_message_text("📋 Ваши задачи:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return MAIN_MENU
+
+# === ДЕТАЛИ ЗАДАЧИ ===
+async def task_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    task_id = int(query.data.replace("task_", ""))
+
+    conn = sqlite3.connect("tasks.db")
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
+    task = cur.fetchone()
+    conn.close()
+
+    text = f"🆔 Задача #{task[0]}\nТип: {task[1]}\nОписание: {task[5]}"
+    if task[1] == "travel":
+        text += f"\nНомер: {task[2]}\nКлиент: {task[3]}\nАдрес: {task[4]}\nСрок: {task[6]}"
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Закрыть задачу", callback_data=f"close_{task[0]}")],
+        [InlineKeyboardButton("❌ Удалить", callback_data=f"delete_{task[0]}")],
+        [InlineKeyboardButton("⬅ Назад", callback_data="my_tasks")]
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    return MAIN_MENU
+
+# === УДАЛЕНИЕ ===
+async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    task_id = int(query.data.replace("delete_", ""))
+    conn = sqlite3.connect("tasks.db")
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+    conn.commit()
+    conn.close()
+    await query.edit_message_text("🗑 Задача удалена.", reply_markup=main_menu_keyboard())
+    return MAIN_MENU
+
+# === ЗАКРЫТИЕ ЗАДАЧИ ===
+async def close_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    task_id = int(query.data.replace("close_", ""))
+    context.user_data["closing_task_id"] = task_id
+    await query.edit_message_text("📎 Прикрепите файл АВР (jpg/png/heic/pdf):")
+    return CLOSE_AVR
+
+async def save_avr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task_id = context.user_data["closing_task_id"]
+
     if update.message.document:
-        tg_file = await file.get_file()
-        filename = file.file_name or f"avr_{tid}"
+        file = update.message.document
+    elif update.message.photo:
+        file = update.message.photo[-1]
     else:
-        tg_file = await file.get_file()
-        filename = f"photo_{tid}.jpg"
-    path = f"avr_{tid}_{filename}"
-    await tg_file.download_to_drive(path)
-    context.user_data["avr_files"].append({"path": path, "name": filename})
-    await update.message.reply_text("Файл добавлен. Можете добавить ещё или нажмите «Готово ✅»", reply_markup=done_keyboard())
-    return ADD_AVR
+        await update.message.reply_text("⚠ Пришлите файл (jpg/png/heic/pdf).")
+        return CLOSE_AVR
 
-async def done_avr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    tid = context.user_data.get("task_id")
-    avr_files = context.user_data.get("avr_files", [])
-    c.execute("UPDATE tasks SET avr=? WHERE id=?", (json.dumps(avr_files), tid))
-    conn.commit()
-    await query.message.reply_text("✏️ Введите описание решения:")
-    return ADD_SOLUTION
+    file_path = f"avr_{task_id}_{file.file_unique_id}"
+    new_file = await file.get_file()
+    await new_file.download_to_drive(file_path)
+    context.user_data["avr_file"] = file_path
 
-async def add_solution(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tid = context.user_data.get("task_id")
+    await update.message.reply_text("✏ Введите описание решения:")
+    return CLOSE_SOLUTION
+
+async def save_solution(update: Update, context: ContextTypes.DEFAULT_TYPE):
     solution = update.message.text
-    c.execute("UPDATE tasks SET solution=?, status='closed' WHERE id=?", (solution, tid))
+    task_id = context.user_data["closing_task_id"]
+
+    conn = sqlite3.connect("tasks.db")
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE tasks SET status=?, avr_file=?, solution=? WHERE id=?",
+        ("done", context.user_data.get("avr_file"), solution, task_id)
+    )
     conn.commit()
-    await update.message.reply_text("✅ Заявка закрыта и перемещена в историю.", reply_markup=main_menu())
-    context.user_data.clear()
-    return ConversationHandler.END
+    conn.close()
 
-async def task_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Задача закрыта и перенесена в историю.", reply_markup=main_menu_keyboard())
+    return MAIN_MENU
+
+# === ИСТОРИЯ ===
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    tid = int(query.data.split("_")[1])
-    c.execute("SELECT client, address, description, deadline FROM tasks WHERE id=?", (tid,))
-    task = c.fetchone()
-    if task:
-        await query.message.reply_text(f"📌 {task[0]} — {task[1]}\n📝 {task[2]}\n⏰ {task[3]}")
+    conn = sqlite3.connect("tasks.db")
+    cur = conn.cursor()
+    cur.execute("SELECT id, type, number, client, address, description, deadline FROM tasks WHERE status='done'")
+    rows = cur.fetchall()
+    conn.close()
 
-async def history_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not rows:
+        await query.edit_message_text("📂 История пуста.", reply_markup=main_menu_keyboard())
+        return MAIN_MENU
+
+    keyboard = [[InlineKeyboardButton(f"#{row[0]} {row[1]} | {row[5]}", callback_data=f"hist_{row[0]}")] for row in rows]
+    keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="back_main")])
+    await query.edit_message_text("📂 История задач:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return MAIN_MENU
+
+# === ДЕТАЛИ В ИСТОРИИ ===
+async def history_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    tid = int(query.data.split("_")[1])
-    c.execute("SELECT client, address, description, deadline, avr, solution FROM tasks WHERE id=?", (tid,))
-    task = c.fetchone()
-    if task:
-        client, addr, desc, deadline, avr, sol = task
-        await query.message.reply_text(f"📌 {client} — {addr}\n📝 {desc}\n⏰ {deadline}\n💡 Решение: {sol}")
-        if avr:
-            avr_files = json.loads(avr)
-            for f in avr_files:
-                await query.message.reply_document(
-                    document=InputFile(f["path"], filename=f["name"]),
-                    caption=f"📎 {f['name']}"
-                )
+    task_id = int(query.data.replace("hist_", ""))
 
-# ----------------- MAIN -----------------
+    conn = sqlite3.connect("tasks.db")
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
+    task = cur.fetchone()
+    conn.close()
+
+    text = f"🆔 Задача #{task[0]}\nТип: {task[1]}\nОписание: {task[5]}"
+    if task[1] == "travel":
+        text += f"\nНомер: {task[2]}\nКлиент: {task[3]}\nАдрес: {task[4]}\nСрок: {task[6]}"
+    text += f"\n📎 Решение: {task[9]}"
+
+    await query.message.reply_text(text)
+    if task[8]:
+        try:
+            with open(task[8], "rb") as f:
+                await query.message.reply_document(InputFile(f))
+        except Exception:
+            await query.message.reply_text("⚠ Ошибка при загрузке файла.")
+    return MAIN_MENU
+
+# === ОБЩИЙ CALLBACK ===
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = update.callback_query.data
+    if data == "new_task":
+        return await new_task(update, context)
+    elif data == "general":
+        return await general_task(update, context)
+    elif data == "travel":
+        return await travel_task(update, context)
+    elif data == "my_tasks":
+        return await my_tasks(update, context)
+    elif data.startswith("task_"):
+        return await task_detail(update, context)
+    elif data.startswith("delete_"):
+        return await delete_task(update, context)
+    elif data.startswith("close_"):
+        return await close_task(update, context)
+    elif data == "history":
+        return await history(update, context)
+    elif data.startswith("hist_"):
+        return await history_detail(update, context)
+    elif data.startswith("client_"):
+        return await save_travel_client(update, context)
+    elif data == "back_main":
+        await update.callback_query.edit_message_text("Главное меню:", reply_markup=main_menu_keyboard())
+        return MAIN_MENU
+
+# === MAIN ===
 def main():
-    TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"
-
+    init_db()
     app = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(menu_handler, pattern="^(new_task)$")],
+        entry_points=[CommandHandler("start", start)],
         states={
-            CHOOSING_CLIENT: [CallbackQueryHandler(choose_client, pattern="^client_")],
-            ENTER_ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_order)],
-            ENTER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_address)],
-            ENTER_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_description)],
-            ENTER_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_deadline)],
-            ADD_AVR: [
-                MessageHandler((filters.Document.ALL | filters.PHOTO), add_avr),
-                CallbackQueryHandler(done_avr, pattern="^done_avr$")
-            ],
-            ADD_SOLUTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_solution)],
+            MAIN_MENU: [CallbackQueryHandler(callbacks)],
+            NEW_TASK_TYPE: [CallbackQueryHandler(callbacks)],
+            GENERAL_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_general_text)],
+            TRAVEL_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_travel_number)],
+            TRAVEL_CLIENT: [CallbackQueryHandler(callbacks)],
+            TRAVEL_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_travel_address)],
+            TRAVEL_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_travel_description)],
+            TRAVEL_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_travel_deadline)],
+            CLOSE_AVR: [MessageHandler(filters.ALL & ~filters.COMMAND, save_avr)],
+            CLOSE_SOLUTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_solution)],
         },
-        fallbacks=[],
-        allow_reentry=True
+        fallbacks=[CommandHandler("start", start)],
     )
 
-    app.add_handler(CommandHandler("start", start))
     app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(menu_handler, pattern="^(my_tasks|history)$"))
-    app.add_handler(CallbackQueryHandler(task_info, pattern="^task_"))
-    app.add_handler(CallbackQueryHandler(history_info, pattern="^history_"))
-
     app.run_polling()
 
 if __name__ == "__main__":
