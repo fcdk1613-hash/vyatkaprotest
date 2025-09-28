@@ -190,7 +190,7 @@ async def history_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ----------------- MAIN -----------------
 def main():
-    TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН"
+    TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"
 
     app = Application.builder().token(TOKEN).build()
 
