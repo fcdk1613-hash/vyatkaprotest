@@ -15,7 +15,7 @@ from telegram.ext import (
 )
 
 # --------------- Настройки ---------------
-TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА"  # <- поставь токен
+TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"  # <- поставь токен
 FILES_DIR = "avr_files"
 os.makedirs(FILES_DIR, exist_ok=True)
 
