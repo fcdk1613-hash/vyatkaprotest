@@ -12,7 +12,7 @@ from telegram.ext import (
 )
 
 # ВСТАВЬ СВОЙ ТОКЕН
-TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН"
+TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
