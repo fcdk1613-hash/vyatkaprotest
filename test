@@ -1,336 +1,940 @@
+#!/usr/bin/env python3
+# coding: utf-8
+
+import os
+import re
+import json
 import logging
 import sqlite3
+from uuid import uuid4
 from datetime import datetime
 from urllib.parse import quote_plus
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
 )
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ConversationHandler, ContextTypes, filters
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
 )
 
-# ВСТАВЬ СВОЙ ТОКЕН
-TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"
+# ----------------- CONFIG -----------------
+TOKEN = "8288052246:AAH2HkB5MVqBA8M6gINmLCap0wZ7Fyn8jKY"  # <-- замените на токен от BotFather
 
+FILES_DIR = "avr_files"
+os.makedirs(FILES_DIR, exist_ok=True)
+
+ALLOWED_EXT = (".pdf", ".jpg", ".jpeg", ".png", ".heic")
+
+# ----------------- LOGGING -----------------
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-(
-    MAIN_MENU,
-    NEW_TASK_TYPE,
-    GENERAL_TEXT,
-    TRAVEL_NUMBER,
-    TRAVEL_CLIENT,
-    TRAVEL_ADDRESS,
-    TRAVEL_DESCRIPTION,
-    TRAVEL_DEADLINE,
-    CLOSE_AVR,
-    CLOSE_SOLUTION,
-) = range(10)
+# ----------------- DB -----------------
+DB_PATH = "tasks.db"
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+c = conn.cursor()
+c.execute("""
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    type TEXT,             -- general | field
+    client TEXT,
+    order_number TEXT,
+    description TEXT,
+    address TEXT,
+    deadline TEXT,         -- as entered: DD.MM.YY HH:MM or DD.MM.YYYY HH:MM
+    status TEXT,           -- active | done
+    avr TEXT,              -- JSON list [{"path": "...", "name":"..."}]
+    solution TEXT
+)
+""")
+conn.commit()
 
+# ----------------- STATES -----------------
+# we'll use ConversationHandler states for main flows and manual context.user_data states inside them
+(
+    S_MAIN,                 # main menu
+    S_NEW_TYPE,             # choose new type
+    S_GENERAL_DESC,         # general: description
+    S_FIELD_ORDER,          # field: order number
+    S_FIELD_CLIENT,         # choose client
+    S_FIELD_ADDRESS,        # address
+    S_FIELD_DESC,           # description
+    S_FIELD_DEADLINE,       # deadline
+    S_COMPLETE_AVR,         # uploading multiple AVR files
+    S_COMPLETE_SOLUTION,    # final solution text
+    S_HISTORY_MENU,         # history main options (date/search)
+    S_HISTORY_YEAR,         # choose year
+    S_HISTORY_MONTH,        # choose month
+    S_HISTORY_DAY,          # choose day
+    S_HISTORY_SEARCH_INPUT  # search input
+) = range(15)
+
+# clients list
 CLIENTS = ["Максавит", "Газпромнефть", "Глория Джинс", "Перекресток", "Тебойл", "Татнефть"]
 
-def init_db():
-    conn = sqlite3.connect("tasks.db")
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS tasks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        type TEXT,
-        number TEXT,
-        client TEXT,
-        address TEXT,
-        description TEXT,
-        deadline TEXT,
-        status TEXT,
-        avr_file TEXT,
-        solution TEXT
-    )
-    """)
-    conn.commit()
-    conn.close()
-
-def main_menu_keyboard():
+# ----------------- UI helpers -----------------
+def kb_main_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Новая задача", callback_data="new_task")],
-        [InlineKeyboardButton("📋 Мои задачи", callback_data="my_tasks")],
-        [InlineKeyboardButton("📂 История", callback_data="history")],
+        [InlineKeyboardButton("➕ Новая задача", callback_data="new")],
+        [InlineKeyboardButton("📌 Текущие", callback_data="current"),
+         InlineKeyboardButton("📜 История", callback_data="history")],
+        [InlineKeyboardButton("ℹ /task <id>", callback_data="help_task")]
     ])
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Привет! Я бот для управления задачами.", reply_markup=main_menu_keyboard())
-    return MAIN_MENU
+def kb_type_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Общая", callback_data="type_general"),
+         InlineKeyboardButton("🚗 Выездная", callback_data="type_field")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
+    ])
 
-# === Создание задач ===
+def kb_clients():
+    rows = []
+    for i in range(0, len(CLIENTS), 2):
+        row = []
+        row.append(InlineKeyboardButton(CLIENTS[i], callback_data=f"client_{CLIENTS[i]}"))
+        if i+1 < len(CLIENTS):
+            row.append(InlineKeyboardButton(CLIENTS[i+1], callback_data=f"client_{CLIENTS[i+1]}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
 
-async def new_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    keyboard = [
-        [InlineKeyboardButton("📝 Общая задача", callback_data="general")],
-        [InlineKeyboardButton("🚗 Выездная задача", callback_data="travel")],
-        [InlineKeyboardButton("⬅ Назад", callback_data="back_main")]
-    ]
-    await query.edit_message_text("Выберите тип задачи:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return NEW_TASK_TYPE
+def kb_task_back():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]])
 
-async def general_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("✏ Введите текст задачи:")
-    return GENERAL_TEXT
+def kb_done_avr(task_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Готово", callback_data=f"avr_done_{task_id}")],
+        [InlineKeyboardButton("⬅️ Отмена", callback_data=f"open_{task_id}")]
+    ])
 
-async def save_general_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    conn = sqlite3.connect("tasks.db")
-    cur = conn.cursor()
-    cur.execute("INSERT INTO tasks (type, description, status) VALUES (?, ?, ?)", ("general", text, "current"))
-    conn.commit()
-    conn.close()
-    await update.message.reply_text("✅ Общая задача сохранена.", reply_markup=main_menu_keyboard())
-    return MAIN_MENU
+def kb_history_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Фильтр по дате", callback_data="hist_date")],
+        [InlineKeyboardButton("🔍 Поиск", callback_data="hist_search")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
+    ])
 
-async def travel_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Введите номер заявки:")
-    return TRAVEL_NUMBER
+# ----------------- Utils -----------------
+def uniq_filename(name: str) -> str:
+    safe = name.replace("/", "_").replace("\\", "_")
+    return f"{uuid4().hex[:8]}_{safe}"
 
-async def save_travel_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["number"] = update.message.text
-    keyboard = [[InlineKeyboardButton(c, callback_data=f"client_{c}")] for c in CLIENTS]
-    await update.message.reply_text("Выберите клиента:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return TRAVEL_CLIENT
-
-async def save_travel_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    client = query.data.replace("client_", "")
-    context.user_data["client"] = client
-    await query.edit_message_text("Введите адрес:")
-    return TRAVEL_ADDRESS
-
-async def save_travel_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["address"] = update.message.text
-    await update.message.reply_text("Введите описание задачи:")
-    return TRAVEL_DESCRIPTION
-
-async def save_travel_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["description"] = update.message.text
-    await update.message.reply_text("Введите срок в формате ДД.ММ.ГГ ЧЧ:ММ")
-    return TRAVEL_DEADLINE
-
-async def save_travel_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    deadline = update.message.text
-    try:
-        datetime.strptime(deadline, "%d.%m.%y %H:%M")
-    except ValueError:
-        await update.message.reply_text("⚠ Неверный формат. Попробуйте снова: ДД.ММ.ГГ ЧЧ:ММ")
-        return TRAVEL_DEADLINE
-    context.user_data["deadline"] = deadline
-    data = context.user_data
-    conn = sqlite3.connect("tasks.db")
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO tasks (type, number, client, address, description, deadline, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, ("travel", data["number"], data["client"], data["address"], data["description"], data["deadline"], "current"))
-    conn.commit()
-    conn.close()
-    await update.message.reply_text("✅ Выездная задача сохранена.", reply_markup=main_menu_keyboard())
-    return MAIN_MENU
-
-# === Работа с задачами ===
-
-async def my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    conn = sqlite3.connect("tasks.db")
-    cur = conn.cursor()
-    cur.execute("SELECT id, type, number, client, address, description, deadline FROM tasks WHERE status='current'")
-    rows = cur.fetchall()
-    conn.close()
-    if not rows:
-        await query.edit_message_text("📋 У вас нет текущих задач.", reply_markup=main_menu_keyboard())
-        return MAIN_MENU
-    keyboard = []
-    for row in rows:
-        if row[1] == "travel":
-            keyboard.append([InlineKeyboardButton(f"🚗 {row[3]} | {row[4]}", callback_data=f"task_{row[0]}")])
-        else:
-            keyboard.append([InlineKeyboardButton(f"📝 {row[5]}", callback_data=f"task_{row[0]}")])
-    keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="back_main")])
-    await query.edit_message_text("📋 Ваши задачи:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return MAIN_MENU
-
-async def task_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    task_id = int(query.data.replace("task_", ""))
-    conn = sqlite3.connect("tasks.db")
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
-    task = cur.fetchone()
-    conn.close()
-    text = f"🆔 Задача #{task[0]}\nТип: {task[1]}\nОписание: {task[5]}"
-    if task[1] == "travel":
-        text += f"\nНомер: {task[2]}\nКлиент: {task[3]}\nАдрес: {task[4]}\nСрок: {task[6]}"
-    keyboard = [
-        [InlineKeyboardButton("✅ Закрыть задачу", callback_data=f"close_{task[0]}")],
-        [InlineKeyboardButton("❌ Удалить", callback_data=f"delete_{task[0]}")],
-        [InlineKeyboardButton("⬅ Назад", callback_data="my_tasks")]
-    ]
-    if task[1] == "travel":
-        map_url = f"https://yandex.ru/maps/?text={quote_plus(task[4])}"
-        keyboard.insert(0, [InlineKeyboardButton("📍 Открыть на карте", url=map_url)])
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    return MAIN_MENU
-
-async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    task_id = int(query.data.replace("delete_", ""))
-    conn = sqlite3.connect("tasks.db")
-    cur = conn.cursor()
-    cur.execute("DELETE FROM tasks WHERE id=?", (task_id,))
-    conn.commit()
-    conn.close()
-    await query.edit_message_text("🗑 Задача удалена.", reply_markup=main_menu_keyboard())
-    return MAIN_MENU
-
-# === Закрытие задач ===
-
-async def close_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    task_id = int(query.data.replace("close_", ""))
-    context.user_data["closing_task_id"] = task_id
-    await query.edit_message_text("📎 Прикрепите файл АВР (jpg/png/heic/pdf):")
-    return CLOSE_AVR
-
-async def save_avr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    task_id = context.user_data["closing_task_id"]
-    file = None
-    if update.message.document:
-        file = update.message.document
-    elif update.message.photo:
-        file = update.message.photo[-1]
-    if not file:
-        await update.message.reply_text("⚠ Пришлите файл (jpg/png/heic/pdf).")
-        return CLOSE_AVR
-    file_path = f"avr_{task_id}_{file.file_unique_id}"
-    new_file = await file.get_file()
-    await new_file.download_to_drive(file_path)
-    context.user_data["avr_file"] = file_path
-    await update.message.reply_text("✏ Введите описание решения:")
-    return CLOSE_SOLUTION
-
-async def save_solution(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    solution = update.message.text
-    task_id = context.user_data["closing_task_id"]
-    conn = sqlite3.connect("tasks.db")
-    cur = conn.cursor()
-    cur.execute("UPDATE tasks SET status=?, avr_file=?, solution=? WHERE id=?",
-                ("done", context.user_data.get("avr_file"), solution, task_id))
-    conn.commit()
-    conn.close()
-    await update.message.reply_text("✅ Задача закрыта и перенесена в историю.", reply_markup=main_menu_keyboard())
-    return MAIN_MENU
-
-# === История ===
-
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    conn = sqlite3.connect("tasks.db")
-    cur = conn.cursor()
-    cur.execute("SELECT id, type, number, client, address, description, deadline FROM tasks WHERE status='done'")
-    rows = cur.fetchall()
-    conn.close()
-    if not rows:
-        await query.edit_message_text("📂 История пуста.", reply_markup=main_menu_keyboard())
-        return MAIN_MENU
-    keyboard = [[InlineKeyboardButton(f"#{row[0]} {row[1]} | {row[5]}", callback_data=f"hist_{row[0]}")] for row in rows]
-    keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="back_main")])
-    await query.edit_message_text("📂 История задач:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return MAIN_MENU
-
-async def history_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    task_id = int(query.data.replace("hist_", ""))
-    conn = sqlite3.connect("tasks.db")
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
-    task = cur.fetchone()
-    conn.close()
-    text = f"🆔 Задача #{task[0]}\nТип: {task[1]}\nОписание: {task[5]}"
-    if task[1] == "travel":
-        text += f"\nНомер: {task[2]}\nКлиент: {task[3]}\nАдрес: {task[4]}\nСрок: {task[6]}"
-    text += f"\n📎 Решение: {task[9]}"
-    await query.message.reply_text(text)
-    if task[8]:
+def parse_deadline_to_dt(text: str) -> datetime | None:
+    # Accept DD.MM.YY HH:MM or DD.MM.YYYY HH:MM
+    if not text:
+        return None
+    text = text.strip()
+    # try patterns
+    for fmt in ("%d.%m.%y %H:%M", "%d.%m.%Y %H:%M"):
         try:
-            with open(task[8], "rb") as f:
-                await query.message.reply_document(InputFile(f))
+            return datetime.strptime(text, fmt)
         except Exception:
-            await query.message.reply_text("⚠ Ошибка при загрузке файла.")
-    return MAIN_MENU
+            continue
+    return None
 
-# === Callback router ===
+def format_date_ymd(dt: datetime) -> tuple:
+    # returns (year, month, day)
+    return dt.year, dt.month, dt.day
 
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = update.callback_query.data
-    if data == "new_task":
-        return await new_task(update, context)
-    elif data == "general":
-        return await general_task(update, context)
-    elif data == "travel":
-        return await travel_task(update, context)
-    elif data == "my_tasks":
-        return await my_tasks(update, context)
-    elif data.startswith("task_"):
-        return await task_detail(update, context)
-    elif data.startswith("delete_"):
-        return await delete_task(update, context)
-    elif data.startswith("close_"):
-        return await close_task(update, context)
-    elif data == "history":
-        return await history(update, context)
-    elif data.startswith("hist_"):
-        return await history_detail(update, context)
-    elif data.startswith("client_"):
-        return await save_travel_client(update, context)
-    elif data == "back_main":
-        await update.callback_query.edit_message_text("Главное меню:", reply_markup=main_menu_keyboard())
-        return MAIN_MENU
+def rows_to_task_buttons(rows):
+    kb = []
+    for row in rows:
+        tid = row[0]
+        ttype = row[2]  # type is at index 2? careful: SELECT columns vary; caller should use full row with known order
+        # This helper is not used; callers build labels explicitly.
 
-def main():
-    init_db()
-    app = Application.builder().token(TOKEN).build()
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            MAIN_MENU: [CallbackQueryHandler(callbacks)],
-            NEW_TASK_TYPE: [CallbackQueryHandler(callbacks)],
-            GENERAL_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_general_text)],
-            TRAVEL_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_travel_number)],
-            TRAVEL_CLIENT: [CallbackQueryHandler(callbacks)],
-            TRAVEL_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_travel_address)],
-            TRAVEL_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_travel_description)],
-            TRAVEL_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_travel_deadline)],
-            CLOSE_AVR: [MessageHandler(filters.ALL & ~filters.COMMAND, save_avr)],
-            CLOSE_SOLUTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_solution)],
-        },
-        fallbacks=[CommandHandler("start", start)],
+# ----------------- Handlers -----------------
+# /start
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("👋 Привет! Я бот для управления задачами.", reply_markup=kb_main_menu())
+    return S_MAIN
+
+# main menu callback router
+async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "new":
+        context.user_data.clear()
+        await query.message.edit_text("Выберите тип задачи:", reply_markup=kb_type_menu())
+        return S_NEW_TYPE
+
+    if data == "current":
+        # list active tasks
+        c.execute("SELECT id, type, client, address, description, deadline FROM tasks WHERE status='active' ORDER BY id DESC")
+        rows = c.fetchall()
+        if not rows:
+            await query.message.reply_text("📭 Нет текущих задач.", reply_markup=kb_main_menu())
+            return S_MAIN
+        kb = []
+        for r in rows:
+            tid, ttype, client, addr, desc, dl = r
+            if ttype == "field":
+                label = f"#{tid} {client} | {addr}"
+            else:
+                label = f"#{tid} {(desc or '')[:30]}"
+            kb.append([InlineKeyboardButton(label, callback_data=f"open_{tid}")])
+        kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
+        await query.message.reply_text("📌 Текущие задачи:", reply_markup=InlineKeyboardMarkup(kb))
+        return S_MAIN
+
+    if data == "history":
+        # go to history menu
+        await query.message.edit_text("📂 История — выбор:", reply_markup=kb_history_menu())
+        return S_HISTORY_MENU
+
+    if data == "help_task":
+        await query.message.reply_text("ℹ Команда: /task <id> — открыть задачу по ID.", reply_markup=kb_main_menu())
+        return S_MAIN
+
+    if data == "back_main":
+        context.user_data.clear()
+        await query.message.edit_text("🏠 Главное меню:", reply_markup=kb_main_menu())
+        return S_MAIN
+
+    # fallback
+    await query.message.reply_text("Нераспознанное действие.", reply_markup=kb_main_menu())
+    return S_MAIN
+
+# choose type handler
+async def choose_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data == "type_general":
+        context.user_data.clear()
+        context.user_data["creating_type"] = "general"
+        await query.message.edit_text("✏ Введите текст общей задачи:")
+        return S_GENERAL_DESC
+    if data == "type_field":
+        context.user_data.clear()
+        context.user_data["creating_type"] = "field"
+        await query.message.edit_text("Введите номер заявки:")
+        return S_FIELD_ORDER
+    if data == "back_main":
+        context.user_data.clear()
+        await query.message.edit_text("🏠 Главное меню:", reply_markup=kb_main_menu())
+        return S_MAIN
+    # else unknown
+    await query.message.reply_text("Неверный выбор.")
+    return S_NEW_TYPE
+
+# general description receive
+async def general_desc_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text:
+        await update.message.reply_text("Описание не может быть пустым. Введите текст:")
+        return S_GENERAL_DESC
+    c.execute("INSERT INTO tasks (user_id, type, description, status) VALUES (?, ?, ?, ?)",
+              (update.effective_user.id, "general", text, "active"))
+    conn.commit()
+    tid = c.lastrowid
+    await update.message.reply_text(f"✅ Общая задача #{tid} добавлена в текущие.", reply_markup=kb_main_menu())
+    context.user_data.clear()
+    return S_MAIN
+
+# field order receive
+async def field_order_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text:
+        await update.message.reply_text("Номер заявки не может быть пустым. Введите номер:")
+        return S_FIELD_ORDER
+    context.user_data["order_number"] = text
+    # show clients
+    await update.message.reply_text("Выберите клиента:", reply_markup=kb_clients())
+    return S_FIELD_CLIENT
+
+# field client callback
+async def field_client_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if not data.startswith("client_"):
+        await query.message.reply_text("Не удалось распознать клиента.")
+        return S_FIELD_CLIENT
+    client = data.split("_", 1)[1]
+    context.user_data["client"] = client
+    await query.message.edit_text(f"Клиент: {client}\nВведите адрес (полный):")
+    return S_FIELD_ADDRESS
+
+# address receive
+async def field_address_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text:
+        await update.message.reply_text("Адрес не может быть пустым. Введите адрес:")
+        return S_FIELD_ADDRESS
+    context.user_data["address"] = text
+    await update.message.reply_text("Введите описание задачи:")
+    return S_FIELD_DESC
+
+# description receive
+async def field_desc_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text:
+        await update.message.reply_text("Описание не может быть пустым. Введите описание:")
+        return S_FIELD_DESC
+    context.user_data["description"] = text
+    await update.message.reply_text("Введите срок (ДД.MM.ГG HH:MM). Пример: 28.09.25 15:30")
+    return S_FIELD_DEADLINE
+
+# deadline receive and save field task
+async def field_deadline_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    dt = parse_deadline_to_dt(text)
+    if not dt:
+        await update.message.reply_text("Неверный формат даты. Ожидается ДД.MM.YY HH:MM или ДД.MM.YYYY HH:MM. Попробуйте снова:")
+        return S_FIELD_DEADLINE
+    # save to DB
+    user_id = update.effective_user.id
+    c.execute("""INSERT INTO tasks (user_id, type, client, order_number, description, address, deadline, status)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+              (user_id, "field", context.user_data.get("client"), context.user_data.get("order_number"),
+               context.user_data.get("description"), context.user_data.get("address"),
+               text, "active"))
+    conn.commit()
+    tid = c.lastrowid
+    await update.message.reply_text(f"✅ Выездная задача #{tid} сохранена.", reply_markup=kb_main_menu())
+    context.user_data.clear()
+    return S_MAIN
+
+# open task detail (from current or history)
+async def open_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # open_<id>
+    try:
+        tid = int(data.split("_", 1)[1])
+    except Exception:
+        await query.message.reply_text("Неверный ID задачи.")
+        return S_MAIN
+    c.execute("SELECT * FROM tasks WHERE id=?", (tid,))
+    row = c.fetchone()
+    if not row:
+        await query.message.reply_text("Задача не найдена.", reply_markup=kb_main_menu())
+        return S_MAIN
+    # row indices: id, user_id, type, client, order_number, description, address, deadline, status, avr, solution
+    _, user_id, ttype, client, order_number, description, address, deadline, status, avr_json, solution = row
+    lines = []
+    lines.append(f"🆔 <b>Задача #{tid}</b>")
+    lines.append(f"📌 <b>Тип:</b> {'🚗 Выездная' if ttype == 'field' else '📝 Общая'}")
+    if client: lines.append(f"🏢 <b>Клиент:</b> {client}")
+    if order_number: lines.append(f"№ <b>Заявки:</b> {order_number}")
+    if description: lines.append(f"📝 <b>Описание:</b> {description}")
+    if address:
+        lines.append(f"📍 <b>Адрес:</b> {address}")
+    lines.append(f"⏰ <b>Срок:</b> {deadline}")
+    lines.append(f"📊 <b>Статус:</b> {'✅ Завершена' if status == 'done' else '🕒 Активна'}")
+    if status == "done" and solution:
+        lines.append(f"🛠 <b>Решение:</b> {solution}")
+
+    # build keyboard: if field — map button; if active — close button.
+    kb = []
+    if ttype == "field" and address:
+        map_url = f"https://yandex.ru/maps/?text={quote_plus(address)}"
+        kb.append([InlineKeyboardButton("📍 Открыть на карте", url=map_url)])
+    if status != "done":
+        kb.append([InlineKeyboardButton("✅ Завершить", callback_data=f"complete_{tid}")])
+    kb.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_{tid}")])
+    kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
+
+    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb), disable_web_page_preview=True)
+
+    # if done and avr files exist — send them
+    if avr_json:
+        try:
+            avr_list = json.loads(avr_json)
+            for f in avr_list:
+                path = f.get("path"); name = f.get("name")
+                if path and os.path.isfile(path):
+                    try:
+                        await query.message.reply_document(document=InputFile(path, filename=name), caption=f"📎 {name}")
+                    except Exception:
+                        try:
+                            await query.message.reply_document(open(path, "rb"), caption=f"📎 {name}")
+                        except Exception:
+                            logger.exception("Не удалось отправить файл %s", path)
+                else:
+                    logger.warning("Файл не найден: %s", path)
+        except Exception:
+            logger.exception("Ошибка при обработке avr JSON")
+    return S_MAIN
+
+# delete flow
+async def delete_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # delete_<id>
+    try:
+        tid = int(data.split("_", 1)[1])
+    except Exception:
+        await query.message.reply_text("Невалидный ID")
+        return S_MAIN
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Подтвердить удаление", callback_data=f"confirm_delete_{tid}")],
+        [InlineKeyboardButton("⬅️ Отмена", callback_data=f"open_{tid}")]
+    ])
+    await query.message.reply_text(f"⚠ Удалить задачу #{tid}?", reply_markup=kb)
+    return S_MAIN
+
+async def confirm_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # confirm_delete_<id>
+    try:
+        tid = int(data.split("_", 2)[2])
+    except Exception:
+        await query.message.reply_text("Неверный формат")
+        return S_MAIN
+    try:
+        c.execute("DELETE FROM tasks WHERE id=?", (tid,))
+        conn.commit()
+        await query.message.reply_text(f"🗑 Задача #{tid} удалена.", reply_markup=kb_main_menu())
+    except Exception:
+        logger.exception("Ошибка при удалении")
+        await query.message.reply_text("❌ Ошибка при удалении.")
+    return S_MAIN
+
+# complete (start uploading multiple AVR files)
+async def complete_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # complete_<id> or open_comp...
+    try:
+        tid = int(data.split("_", 1)[1])
+    except Exception:
+        await query.message.reply_text("Неверный ID")
+        return S_MAIN
+    # prepare context for multiple files
+    context.user_data["complete_id"] = tid
+    context.user_data["avr_files"] = []
+    context.user_data["state_manual"] = "await_avr"
+    await query.message.reply_text(
+        "📎 Прикрепите файлы АВР (pdf/jpg/png/heic) — можно несколько подряд.\n"
+        "Когда закончите — нажмите кнопку «Готово».",
+        reply_markup=kb_done_avr(tid)
     )
-    app.add_handler(conv_handler)
-    app.run_polling()
+    return S_COMPLETE_AVR
+
+# handler when user uploads documents/photos during completion
+async def avr_file_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ensure we're in the flow
+    state = context.user_data.get("state_manual")
+    if state != "await_avr":
+        await update.message.reply_text("Я сейчас не ожидаю файлы. Нажмите главное меню.", reply_markup=kb_main_menu())
+        return S_MAIN
+
+    tid = context.user_data.get("complete_id")
+    if not tid:
+        await update.message.reply_text("Внутренняя ошибка: id задачи не найден.", reply_markup=kb_main_menu())
+        context.user_data.clear()
+        return S_MAIN
+
+    # document
+    if update.message.document:
+        doc = update.message.document
+        orig_name = doc.file_name or f"file_{tid}"
+        _, ext = os.path.splitext(orig_name)
+        if ext.lower() not in ALLOWED_EXT:
+            await update.message.reply_text("⚠ Разрешены только PDF/JPG/PNG/HEIC.")
+            return S_COMPLETE_AVR
+        tgfile = await doc.get_file()
+        saved = uniq_filename(orig_name)
+        path = os.path.join(FILES_DIR, saved)
+        await tgfile.download_to_drive(path)
+        context.user_data.setdefault("avr_files", []).append({"path": path, "name": orig_name})
+        await update.message.reply_text(f"✅ Файл {orig_name} сохранён. Добавьте ещё или нажмите «Готово».", reply_markup=kb_done_avr(tid))
+        return S_COMPLETE_AVR
+
+    # photo
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        tgfile = await photo.get_file()
+        orig_name = f"photo_{photo.file_unique_id}.jpg"
+        saved = uniq_filename(orig_name)
+        path = os.path.join(FILES_DIR, saved)
+        await tgfile.download_to_drive(path)
+        context.user_data.setdefault("avr_files", []).append({"path": path, "name": orig_name})
+        await update.message.reply_text("✅ Фото сохранено. Добавьте ещё или нажмите «Готово».", reply_markup=kb_done_avr(tid))
+        return S_COMPLETE_AVR
+
+    await update.message.reply_text("Тип файла не поддерживается. Пришлите pdf/jpg/png/heic или фото.")
+    return S_COMPLETE_AVR
+
+# button "Done" callback while uploading AVR
+async def avr_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    # callback_data = avr_done_<tid>
+    parts = query.data.split("_")
+    if len(parts) >= 3:
+        try:
+            tid = int(parts[2])
+        except Exception:
+            tid = context.user_data.get("complete_id")
+    else:
+        tid = context.user_data.get("complete_id")
+    if not tid:
+        await query.message.reply_text("Внутренняя ошибка: id задачи не найден.")
+        context.user_data.clear()
+        return S_MAIN
+    avr_files = context.user_data.get("avr_files", [])
+    try:
+        c.execute("UPDATE tasks SET avr=? WHERE id=?", (json.dumps(avr_files, ensure_ascii=False), tid))
+        conn.commit()
+    except Exception:
+        logger.exception("Не удалось сохранить AVR в БД")
+        await query.message.reply_text("❌ Ошибка при сохранении файлов.")
+        context.user_data.clear()
+        return S_MAIN
+    context.user_data["state_manual"] = "await_solution"
+    context.user_data["complete_id"] = tid
+    await query.message.reply_text("✏ Напишите краткое описание решения:")
+    return S_COMPLETE_SOLUTION
+
+# solution receive and finish
+async def solution_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = context.user_data.get("state_manual")
+    if state != "await_solution":
+        await update.message.reply_text("Я не ожидал это сообщение. Вернитесь в меню.", reply_markup=kb_main_menu())
+        return S_MAIN
+    tid = context.user_data.get("complete_id")
+    if not tid:
+        await update.message.reply_text("Внутренняя ошибка: id не найден.", reply_markup=kb_main_menu())
+        context.user_data.clear()
+        return S_MAIN
+    sol = update.message.text.strip()
+    try:
+        c.execute("UPDATE tasks SET solution=?, status=? WHERE id=?", (sol, "done", tid))
+        conn.commit()
+        await update.message.reply_text(f"✅ Задача #{tid} завершена и перенесена в историю.", reply_markup=kb_main_menu())
+    except Exception:
+        logger.exception("Ошибка при сохранении решения")
+        await update.message.reply_text("❌ Ошибка при завершении задачи.", reply_markup=kb_main_menu())
+    context.user_data.clear()
+    return S_MAIN
+
+# HISTORY flows: menu -> date filter or search
+async def history_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data == "hist_date":
+        # build list of years from done tasks deadlines
+        c.execute("SELECT deadline FROM tasks WHERE status='done' AND deadline IS NOT NULL")
+        rows = c.fetchall()
+        years = set()
+        for (dl,) in rows:
+            dt = parse_deadline_to_dt(dl)
+            if dt:
+                years.add(dt.year)
+        if not years:
+            await query.message.reply_text("Нет дат в истории.", reply_markup=kb_main_menu())
+            return S_MAIN
+        years = sorted(list(years), reverse=True)
+        kb = [[InlineKeyboardButton(str(y), callback_data=f"hist_year_{y}")] for y in years]
+        kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="history_back")])
+        await query.message.reply_text("Выберите год:", reply_markup=InlineKeyboardMarkup(kb))
+        return S_HISTORY_YEAR
+
+    if data == "hist_search":
+        await query.message.reply_text("🔍 Введите строку для поиска по номеру заявки, клиенту или адресу:")
+        context.user_data["history_search"] = ""
+        return S_HISTORY_SEARCH_INPUT
+
+    if data == "back_main":
+        await query.message.edit_message_text("🏠 Главное меню:", reply_markup=kb_main_menu())
+        return S_MAIN
+
+    if data == "back_main" or data == "history_back":
+        await query.message.edit_text("🏠 Главное меню:", reply_markup=kb_main_menu())
+        return S_MAIN
+
+    # fallback
+    await query.message.reply_text("Неизвестная опция истории.", reply_markup=kb_main_menu())
+    return S_MAIN
+
+# choose year -> show months
+async def history_year_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # hist_year_<YYYY>
+    parts = data.split("_")
+    if len(parts) != 3:
+        await query.message.reply_text("Неверный формат года.")
+        return S_HISTORY_YEAR
+    year = int(parts[2])
+    # get months available for this year
+    c.execute("SELECT deadline FROM tasks WHERE status='done' AND deadline IS NOT NULL")
+    rows = c.fetchall()
+    months = set()
+    for (dl,) in rows:
+        dt = parse_deadline_to_dt(dl)
+        if dt and dt.year == year:
+            months.add(dt.month)
+    if not months:
+        await query.message.reply_text("Нет записей за этот год.", reply_markup=kb_main_menu())
+        return S_MAIN
+    months = sorted(list(months))
+    kb = []
+    for m in months:
+        kb.append([InlineKeyboardButton(f"{m:02d}", callback_data=f"hist_month_{year}_{m}")])
+    kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="history_back")])
+    await query.message.reply_text(f"Год: {year}. Выберите месяц:", reply_markup=InlineKeyboardMarkup(kb))
+    return S_HISTORY_MONTH
+
+# choose month -> show days
+async def history_month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # hist_month_YYYY_M
+    parts = data.split("_")
+    if len(parts) != 4:
+        await query.message.reply_text("Неверный формат месяца.")
+        return S_HISTORY_MONTH
+    year = int(parts[2]); month = int(parts[3])
+    c.execute("SELECT id, deadline FROM tasks WHERE status='done' AND deadline IS NOT NULL")
+    rows = c.fetchall()
+    days = {}
+    for tid, dl in rows:
+        dt = parse_deadline_to_dt(dl)
+        if dt and dt.year == year and dt.month == month:
+            days.setdefault(dt.day, []).append(tid)
+    if not days:
+        await query.message.reply_text("Нет записей за этот месяц.", reply_markup=kb_main_menu())
+        return S_MAIN
+    kb = []
+    for d in sorted(days.keys()):
+        kb.append([InlineKeyboardButton(f"{d:02d}", callback_data=f"hist_day_{year}_{month}_{d}")])
+    kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="history_back")])
+    await query.message.reply_text(f"{year}-{month:02d}. Выберите день:", reply_markup=InlineKeyboardMarkup(kb))
+    return S_HISTORY_DAY
+
+# choose day -> show list of tasks of that day
+async def history_day_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # hist_day_YYYY_M_D
+    parts = data.split("_")
+    if len(parts) != 5:
+        await query.message.reply_text("Неверный формат дня.")
+        return S_HISTORY_DAY
+    year = int(parts[2]); month = int(parts[3]); day = int(parts[4])
+    c.execute("SELECT id, type, client, address, description, deadline FROM tasks WHERE status='done' AND deadline IS NOT NULL")
+    rows = c.fetchall()
+    pick = []
+    for r in rows:
+        tid, ttype, client, address, desc, dl = r
+        dt = parse_deadline_to_dt(dl)
+        if dt and dt.year == year and dt.month == month and dt.day == day:
+            if ttype == "field":
+                label = f"#{tid} {client} | {address}"
+            else:
+                label = f"#{tid} { (desc or '')[:30] }"
+            pick.append((tid, label))
+    if not pick:
+        await query.message.reply_text("Записей за этот день нет.", reply_markup=kb_main_menu())
+        return S_MAIN
+    kb = [[InlineKeyboardButton(label, callback_data=f"open_{tid}")] for tid, label in pick]
+    kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="history_back")])
+    await query.message.reply_text(f"Задачи за {day:02d}.{month:02d}.{year}:", reply_markup=InlineKeyboardMarkup(kb))
+    return S_MAIN
+
+# search input handler
+async def history_search_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text:
+        await update.message.reply_text("Введите поисковую строку (номер заявки, клиент или адрес):")
+        return S_HISTORY_SEARCH_INPUT
+    q = f"%{text}%"
+    c.execute("SELECT id, type, client, address, description FROM tasks WHERE (order_number LIKE ? OR client LIKE ? OR address LIKE ?) AND status='done'", (q, q, q))
+    rows = c.fetchall()
+    if not rows:
+        await update.message.reply_text("Ничего не найдено.", reply_markup=kb_main_menu())
+        return S_MAIN
+    kb = []
+    for r in rows:
+        tid, ttype, client, address, desc = r
+        if ttype == "field":
+            label = f"#{tid} {client} | {address}"
+        else:
+            label = f"#{tid} { (desc or '')[:30] }"
+        kb.append([InlineKeyboardButton(label, callback_data=f"open_{tid}")])
+    kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_main")])
+    await update.message.reply_text("Результаты поиска:", reply_markup=InlineKeyboardMarkup(kb))
+    return S_MAIN
+
+# /task <id> command
+async def cmd_task_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("Использование: /task <id>")
+        return
+    try:
+        tid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом")
+        return
+    c.execute("SELECT * FROM tasks WHERE id=?", (tid,))
+    row = c.fetchone()
+    if not row:
+        await update.message.reply_text("Задача не найдена.", reply_markup=kb_main_menu())
+        return
+    # reuse open logic: mimic a CallbackQuery-like response by sending same text & files
+    _, user_id, ttype, client, order_number, description, address, deadline, status, avr_json, solution = row
+    lines = []
+    lines.append(f"🆔 <b>Задача #{tid}</b>")
+    lines.append(f"📌 <b>Тип:</b> {'🚗 Выездная' if ttype == 'field' else '📝 Общая'}")
+    if client: lines.append(f"🏢 <b>Клиент:</b> {client}")
+    if order_number: lines.append(f"№ <b>Заявки:</b> {order_number}")
+    if description: lines.append(f"📝 <b>Описание:</b> {description}")
+    if address:
+        lines.append(f"📍 <b>Адрес:</b> {address}")
+        lines.append(f"🔗 <a href='https://yandex.ru/maps/?text={quote_plus(address)}'>Открыть в Яндекс.Картах</a>")
+    lines.append(f"⏰ <b>Срок:</b> {deadline}")
+    lines.append(f"📊 <b>Статус:</b> {'✅ Завершена' if status == 'done' else '🕒 Активна'}")
+    if status == "done" and solution:
+        lines.append(f"🛠 <b>Решение:</b> {solution}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb_main_menu())
+    # send files if any
+    if avr_json:
+        try:
+            avr_list = json.loads(avr_json)
+            for f in avr_list:
+                path = f.get("path"); name = f.get("name")
+                if path and os.path.isfile(path):
+                    try:
+                        await update.message.reply_document(document=InputFile(path, filename=name), caption=f"📎 {name}")
+                    except Exception:
+                        try:
+                            await update.message.reply_document(open(path, "rb"), caption=f"📎 {name}")
+                        except Exception:
+                            logger.exception("Failed to send file %s", path)
+        except Exception:
+            logger.exception("Failed to parse avr_json for /task")
+    return
+
+# generic callback router to dispatch based on prefix
+async def generic_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = update.callback_query.data
+    # create flows
+    if data in ("new", "current", "history", "help_task", "back_main"):
+        return await main_menu_callback(update, context)
+    if data in ("type_general", "type_field", "back_main"):
+        return await choose_type_callback(update, context)
+    if data.startswith("client_"):
+        return await field_client_callback(update, context)
+    if data.startswith("open_"):
+        return await open_task_callback(update, context)
+    if data.startswith("delete_"):
+        return await delete_task_callback(update, context)
+    if data.startswith("confirm_delete_"):
+        return await confirm_delete_callback(update, context)
+    if data.startswith("complete_") or data.startswith("close_") or data.startswith("complete_"):
+        # accommodate different callback naming
+        # prefer 'complete_' entrypoints
+        return await complete_start_callback(update, context)
+    if data.startswith("avr_done_"):
+        return await avr_done_callback(update, context)
+    if data == "hist_date" or data == "hist_search" or data == "history_back":
+        return await history_menu_callback(update, context)
+    if data.startswith("hist_year_"):
+        return await history_year_callback(update, context)
+    if data.startswith("hist_month_"):
+        return await history_month_callback(update, context)
+    if data.startswith("hist_day_"):
+        return await history_day_callback(update, context)
+    if data.startswith("hist_"):
+        # open history detail
+        return await history_detail_callback_by_id(update, context)
+    # unknown
+    await update.callback_query.answer("Неизвестная команда")
+
+# history detail from hist_... (open historical task id)
+async def history_detail_callback_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # hist_<id>
+    try:
+        tid = int(data.split("_",1)[1])
+    except Exception:
+        await query.message.reply_text("Неверный ID")
+        return S_MAIN
+    # re-use open handler by modifying callback.data to open_<id> and calling open_task_callback
+    # but simpler: query the DB and send similar output
+    c.execute("SELECT * FROM tasks WHERE id=?", (tid,))
+    row = c.fetchone()
+    if not row:
+        await query.message.reply_text("Задача не найдена.")
+        return S_MAIN
+    _, user_id, ttype, client, order_number, description, address, deadline, status, avr_json, solution = row
+    lines = []
+    lines.append(f"🆔 <b>Задача #{tid}</b>")
+    lines.append(f"📌 <b>Тип:</b> {'🚗 Выездная' if ttype == 'field' else '📝 Общая'}")
+    if client: lines.append(f"🏢 <b>Клиент:</b> {client}")
+    if order_number: lines.append(f"№ <b>Заявки:</b> {order_number}")
+    if description: lines.append(f"📝 <b>Описание:</b> {description}")
+    if address:
+        lines.append(f"📍 <b>Адрес:</b> {address}")
+        lines.append(f"🔗 <a href='https://yandex.ru/maps/?text={quote_plus(address)}'>Открыть в Яндекс.Картах</a>")
+    lines.append(f"⏰ <b>Срок:</b> {deadline}")
+    lines.append(f"📊 <b>Статус:</b> {'✅ Завершена' if status == 'done' else '🕒 Активна'}")
+    if status == "done" and solution:
+        lines.append(f"🛠 <b>Решение:</b> {solution}")
+    await query.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb_main_menu())
+    # files
+    if avr_json:
+        try:
+            avr_list = json.loads(avr_json)
+            for f in avr_list:
+                path = f.get("path"); name = f.get("name")
+                if path and os.path.isfile(path):
+                    try:
+                        await query.message.reply_document(document=InputFile(path, filename=name), caption=f"📎 {name}")
+                    except Exception:
+                        try:
+                            await query.message.reply_document(open(path, "rb"), caption=f"📎 {name}")
+                        except Exception:
+                            logger.exception("Не удалось отправить файл %s", path)
+        except Exception:
+            logger.exception("Ошибка при отправке AVR")
+    return S_MAIN
+
+# catch text messages depending on state groups
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Determine which conversation state we're in using ConversationHandler state or user_data
+    # This router handles: general desc, field order, address, desc, deadline, solution, history search input
+    # We'll check update.message.chat.type etc.
+    # Use message text to route based on last ConversationHandler state via context.user_data keys or conversation state machine
+    # Priority: solution_receive (if awaiting solution), field flows, general desc, history search
+    if context.user_data.get("state_manual") == "await_solution":
+        # handle solution text
+        return await solution_receive(update, context)
+
+    # If in field creation steps: check presence of keys
+    # If user started creating a field and we expect order:
+    if context.user_data.get("creating_type") == "field" and "order_number" not in context.user_data:
+        return await field_order_receive(update, context)
+    if context.user_data.get("creating_type") == "field" and "order_number" in context.user_data and "client" not in context.user_data:
+        # shouldn't happen: client chosen by callback; but if user typed, ignore
+        await update.message.reply_text("Пожалуйста, выберите клиента кнопкой.")
+        return S_FIELD_CLIENT
+    if context.user_data.get("creating_type") == "field" and "client" in context.user_data and "address" not in context.user_data:
+        return await field_address_receive(update, context)
+    if context.user_data.get("creating_type") == "field" and "address" in context.user_data and "description" not in context.user_data:
+        return await field_desc_receive(update, context)
+    if context.user_data.get("creating_type") == "field" and "description" in context.user_data and "deadline" not in context.user_data:
+        return await field_deadline_receive(update, context)
+
+    # If creating general
+    if context.user_data.get("creating_type") == "general" and "description" not in context.user_data:
+        return await general_desc_receive(update, context)
+
+    # If awaiting AVR files (manual state)
+    if context.user_data.get("state_manual") == "await_avr":
+        return await avr_file_receive(update, context)
+
+    # If awaiting history search input
+    # We'll check if last called state was S_HISTORY_SEARCH_INPUT using a flag in user_data
+    if context.user_data.get("awaiting_history_search"):
+        # handle history search
+        # clear flag
+        context.user_data.pop("awaiting_history_search", None)
+        return await history_search_input(update, context)
+
+    # fallback
+    await update.message.reply_text("Нажмите кнопку в меню.", reply_markup=kb_main_menu())
+    return S_MAIN
+
+# register handlers and start
+def main():
+    if TOKEN == "ВСТАВЬ_СВОЙ_ТОКЕН" or not TOKEN:
+        raise SystemExit("Пожалуйста, пропишите токен в переменной TOKEN в начале файла.")
+
+    app = Application.builder().token(TOKEN).build()
+
+    # ConversationHandler main entry is /start
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start_handler)],
+        states={
+            S_MAIN: [
+                CallbackQueryHandler(main_menu_callback, pattern="^(new|current|history|help_task|back_main)$")
+            ],
+            S_NEW_TYPE: [
+                CallbackQueryHandler(choose_type_callback, pattern="^(type_general|type_field|back_main)$")
+            ],
+            S_GENERAL_DESC: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, general_desc_receive)
+            ],
+            S_FIELD_ORDER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, field_order_receive)
+            ],
+            S_FIELD_CLIENT: [
+                CallbackQueryHandler(field_client_callback, pattern="^client_")
+            ],
+            S_FIELD_ADDRESS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, field_address_receive)
+            ],
+            S_FIELD_DESC: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, field_desc_receive)
+            ],
+            S_FIELD_DEADLINE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, field_deadline_receive)
+            ],
+            S_COMPLETE_AVR: [
+                MessageHandler((filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND, avr_file_receive),
+                CallbackQueryHandler(avr_done_callback, pattern=r"^avr_done_\d+$")
+            ],
+            S_COMPLETE_SOLUTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, solution_receive)
+            ],
+            S_HISTORY_MENU: [
+                CallbackQueryHandler(history_menu_callback, pattern="^(hist_date|hist_search|back_main|history_back)$")
+            ],
+            S_HISTORY_YEAR: [
+                CallbackQueryHandler(history_year_callback, pattern=r"^hist_year_\d{4}$")
+            ],
+            S_HISTORY_MONTH: [
+                CallbackQueryHandler(history_month_callback, pattern=r"^hist_month_\d{4}_\d{1,2}$")
+            ],
+            S_HISTORY_DAY: [
+                CallbackQueryHandler(history_day_callback, pattern=r"^hist_day_\d{4}_\d{1,2}_\d{1,2}$")
+            ],
+            S_HISTORY_SEARCH_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, history_search_input)
+            ],
+        },
+        fallbacks=[CommandHandler("start", start_handler)],
+        allow_reentry=True
+    )
+
+    # register conversation
+    app.add_handler(conv)
+
+    # generic callback router for actions not in conv state patterns (open/delete/etc)
+    app.add_handler(CallbackQueryHandler(generic_callback_router, pattern=".*"))
+
+    # /task command
+    app.add_handler(CommandHandler("task", cmd_task_by_id))
+
+    # run
+    logger.info("Bot starting...")
+    app.run_polling(allowed_updates=["message", "callback_query", "document", "photo"])
 
 if __name__ == "__main__":
     main()
